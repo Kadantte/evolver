@@ -130,7 +130,11 @@ function isCriticalProtectedPath(relPath) {
 }
 
 function rollbackTracked(repoRoot) {
-  const mode = String(process.env.EVOLVER_ROLLBACK_MODE || 'hard').toLowerCase();
+  // Default 'stash' (was 'hard' through 1.80.7): a failed solidify cycle should
+  // preserve the user's working-tree state in `git stash` so it can be recovered
+  // via `git stash pop`, rather than discarding it via `git reset --hard`. The
+  // hard-reset path remains available with explicit `EVOLVER_ROLLBACK_MODE=hard`.
+  const mode = String(process.env.EVOLVER_ROLLBACK_MODE || 'stash').toLowerCase();
 
   if (mode === 'none') {
     console.log('[Rollback] EVOLVER_ROLLBACK_MODE=none, skipping rollback');
@@ -155,10 +159,37 @@ function rollbackTracked(repoRoot) {
   tryRunCmd('git reset --hard', { cwd: repoRoot, timeoutMs: 60000 });
 }
 
-function rollbackNewUntrackedFiles({ repoRoot, baselineUntracked }) {
+function rollbackNewUntrackedFiles({ repoRoot, baselineUntracked, cycleStartedAt }) {
   const baseline = new Set((Array.isArray(baselineUntracked) ? baselineUntracked : []).map(String));
   const current = gitListUntrackedFiles(repoRoot);
-  const toDelete = current.filter(f => !baseline.has(String(f)));
+  // mtime guard: only delete files whose mtime is at-or-after the cycle start.
+  // This protects files the user created/touched concurrently from another
+  // editor between baseline capture and rollback. Without this guard, a parallel
+  // unrelated edit landing in this window would be silently deleted.
+  // `cycleStartedAt` accepts ISO string (e.g. last_run.created_at) or epoch ms.
+  // When unset (legacy callers, tests), behaviour falls back to the prior
+  // baseline-only filter.
+  const cycleStartMs = (function () {
+    if (cycleStartedAt == null) return 0;
+    if (typeof cycleStartedAt === 'number' && Number.isFinite(cycleStartedAt)) return cycleStartedAt;
+    const parsed = Date.parse(String(cycleStartedAt));
+    return Number.isFinite(parsed) ? parsed : 0;
+  })();
+  const toDelete = current.filter(f => {
+    if (baseline.has(String(f))) return false;
+    if (!cycleStartMs) return true; // no guard available -> preserve old behaviour
+    try {
+      const abs = path.resolve(repoRoot, String(f));
+      const st = fs.statSync(abs);
+      // -1 ms tolerance for filesystem mtime resolution boundary.
+      return st.mtimeMs >= cycleStartMs - 1;
+    } catch {
+      // Can't stat (race, permissions, broken symlink): err on the side of
+      // not deleting. The file will appear again on the next cleanup if
+      // it really is garbage.
+      return false;
+    }
+  });
   const skipped = [];
   const deleted = [];
   for (const rel of toDelete) {
