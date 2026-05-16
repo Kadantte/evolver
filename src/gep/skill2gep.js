@@ -586,17 +586,25 @@ function runOnSkillInvocation(opts) {
 // is attached (Gene-only bundles are not supported by the A2A schema). Each
 // channel's failure is isolated so a broken one cannot block the other.
 // ---------------------------------------------------------------------------
+// publishAssets runs two independent publish channels in parallel:
+//   skill_store: skillPublisher.publishSkillToHub (human-facing Gene index)
+//   gep_bundle:  a2a.httpTransportSend (machine-facing auditable channel)
+// ok is true only when at least one channel succeeds with a real (non-dry-run) publish.
+// When HUB_DRY_RUN is active, both channels short-circuit and ok is false;
+// callers should check result.dry_run to distinguish from a real failure.
 function publishAssets(gene, capsule) {
   const skillPromise = publishSkillChannel(gene);
   const bundlePromise = capsule ? publishBundleChannel(gene, capsule) : Promise.resolve({ ok: false, skipped: 'no_capsule' });
   return Promise.all([skillPromise, bundlePromise]).then(([skill, bundle]) => ({
     skill_store: skill,
     gep_bundle: bundle,
-    ok: Boolean((skill && skill.ok) || (bundle && bundle.ok)),
+    ok: Boolean((skill && skill.ok && !skill.dry_run) || (bundle && bundle.ok && !bundle.dry_run)),
+    dry_run: Boolean((skill && skill.dry_run) || (bundle && bundle.dry_run)),
   }));
 }
 
 function publishSkillChannel(gene) {
+  if (a2a._isDryRun()) return Promise.resolve({ ok: true, dry_run: true });
   try {
     const p = skillPublisher.publishSkillToHub(gene);
     return Promise.resolve(p).catch((err) => ({ ok: false, error: err && err.message ? err.message : String(err) }));

@@ -58,7 +58,7 @@ function exportGepx({ assetsDir, memoryGraphPath, outputPath, agentId, agentName
     fs.mkdirSync(path.dirname(f.dest), { recursive: true });
     fs.writeFileSync(f.dest, content);
     const hash = crypto.createHash('sha256').update(content).digest('hex');
-    checksums.push(`${hash}  ${path.relative(tmpDir, f.dest)}`);
+    checksums.push(`${hash}  ${path.relative(tmpDir, f.dest).replace(/\\/g, '/')}`);
   }
 
   const stats = {
@@ -83,7 +83,14 @@ function exportGepx({ assetsDir, memoryGraphPath, outputPath, agentId, agentName
   fs.writeFileSync(path.join(tmpDir, 'checksum.sha256'), checksums.join('\n') + '\n');
 
   try {
-    execFileSync('tar', ['-czf', outputPath, '-C', tmpDir, '.'], { timeout: 60000 });
+    // Run tar from inside tmpDir with a relative output path so no absolute
+    // Windows paths (e.g. "C:\...") are passed to tar. GNU tar on Windows
+    // (Git for Windows) misparses "C:" as a remote hostname when it appears
+    // in the -czf argument, causing "Cannot connect to C: resolve failed".
+    // Since tmpDir = outputPath + ".tmp" they share the same parent, so the
+    // relative output path is always "../<basename>".
+    const relOut = path.join('..', path.basename(outputPath));
+    execFileSync('tar', ['-czf', relOut, '.'], { cwd: tmpDir, timeout: 60000 });
   } catch (err) {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     throw new Error(`tar failed: ${err.message}. Ensure tar is available on your system.`);

@@ -24,3 +24,8 @@ logs/
 
 # Local triage notes (per-machine, never shipped to public or commits)
 TRIAGE.md
+
+# Cooperative-yield lock (created by users / release tooling to make the
+# evolver --loop daemon stand down for a cycle). See src/evolve/guards.js.
+# Always per-machine, never committed.
+.evolver.lock

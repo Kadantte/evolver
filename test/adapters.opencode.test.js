@@ -104,7 +104,10 @@ describe('opencode adapter: install', () => {
       }
 
       // The plugin must point at this install's hooks dir absolutely.
-      assert.ok(pluginSrc.includes(hooksDir), 'plugin should reference absolute hooks dir');
+      // On Windows, JSON.stringify escapes backslashes to \\, so compare against
+      // the escaped form that actually appears in the generated plugin source.
+      const hooksDirInSrc = JSON.stringify(hooksDir).slice(1, -1);
+      assert.ok(pluginSrc.includes(hooksDirInSrc), 'plugin should reference absolute hooks dir');
 
       const agentsMd = fs.readFileSync(path.join(tmp, 'AGENTS.md'), 'utf8');
       assert.ok(agentsMd.includes('Evolution Memory'));

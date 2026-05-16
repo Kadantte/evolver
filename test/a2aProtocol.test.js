@@ -22,7 +22,11 @@ const {
   sendHeartbeat,
   hubOpenEventStream,
   mergeAndCap,
+  httpTransportSend,
+  httpTransportReceive,
+  _resetDryRunWarnedForTesting,
 } = require('../src/gep/a2aProtocol');
+const { computeAssetId } = require('../src/gep/contentHash');
 
 describe('protocol constants', () => {
   it('has expected protocol name', () => {
@@ -379,5 +383,158 @@ describe('mergeAndCap', () => {
     // After 150 total entries, oldest 50 should be gone (id 0-49 dropped)
     assert.equal(acc[0].id, 50);
     assert.equal(acc[99].id, 149);
+  });
+});
+
+describe('httpTransportReceive asset_id filter', () => {
+  var originalFetch;
+  var originalHubUrl;
+
+  before(() => {
+    originalFetch = global.fetch;
+    originalHubUrl = process.env.A2A_HUB_URL;
+    process.env.A2A_HUB_URL = 'http://localhost:19999';
+  });
+
+  after(() => {
+    global.fetch = originalFetch;
+    if (originalHubUrl === undefined) delete process.env.A2A_HUB_URL;
+    else process.env.A2A_HUB_URL = originalHubUrl;
+  });
+
+  it('discards assets with no asset_id (tamper bypass prevention)', async () => {
+    global.fetch = async function () {
+      return { ok: true, json: async function () { return { payload: { results: [{ type: 'Gene', id: 'g1' }] } }; } };
+    };
+    var result = await httpTransportReceive({});
+    assert.equal(result.length, 0);
+  });
+
+  it('passes through assets whose asset_id matches content hash', async () => {
+    var asset = { type: 'Gene', id: 'g2', strategy: ['x'] };
+    asset.asset_id = computeAssetId(asset);
+    global.fetch = async function () {
+      return { ok: true, json: async function () { return { payload: { results: [asset] } }; } };
+    };
+    var result = await httpTransportReceive({});
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'g2');
+  });
+
+  it('discards assets whose asset_id does not match content hash', async () => {
+    var asset = { type: 'Gene', id: 'g3', asset_id: 'sha256:deadbeef' };
+    global.fetch = async function () {
+      return { ok: true, json: async function () { return { payload: { results: [asset] } }; } };
+    };
+    var result = await httpTransportReceive({});
+    assert.equal(result.length, 0);
+  });
+
+  it('keeps valid assets and discards tampered or missing-asset_id ones in a mixed batch', async () => {
+    var good = { type: 'Gene', id: 'g4', strategy: ['y'] };
+    good.asset_id = computeAssetId(good);
+    var bad = { type: 'Capsule', id: 'c1', asset_id: 'sha256:bad' };
+    var noId = { type: 'Gene', id: 'g5' };
+    global.fetch = async function () {
+      return { ok: true, json: async function () { return { payload: { results: [good, bad, noId] } }; } };
+    };
+    var result = await httpTransportReceive({});
+    // noId is discarded (missing asset_id treated as untrusted, same as tampered)
+    assert.equal(result.length, 1);
+    assert.equal(result[0].id, 'g4');
+  });
+});
+
+describe('httpTransportSend HUB_DRY_RUN', () => {
+  var originalDryRun;
+  var originalHubUrl;
+
+  before(() => {
+    originalDryRun = process.env.HUB_DRY_RUN;
+    originalHubUrl = process.env.A2A_HUB_URL;
+    _resetDryRunWarnedForTesting();
+  });
+
+  after(() => {
+    if (originalDryRun === undefined) delete process.env.HUB_DRY_RUN;
+    else process.env.HUB_DRY_RUN = originalDryRun;
+    if (originalHubUrl === undefined) delete process.env.A2A_HUB_URL;
+    else process.env.A2A_HUB_URL = originalHubUrl;
+    _resetDryRunWarnedForTesting();
+  });
+
+  it('returns ok:true with dry_run:true when HUB_DRY_RUN=1', async () => {
+    process.env.HUB_DRY_RUN = '1';
+    var msg = buildMessage({ messageType: 'hello', payload: {} });
+    var result = await httpTransportSend(msg, {});
+    assert.equal(result.ok, true);
+    assert.equal(result.dry_run, true);
+  });
+
+  it('accepts yes/on/true as truthy HUB_DRY_RUN values', async () => {
+    var msg = buildMessage({ messageType: 'hello', payload: {} });
+    // 'Yes' and 'On' exercise the .toLowerCase() path; 'true' and '1' are canonical forms.
+    for (var val of ['yes', 'on', 'true', 'Yes']) {
+      process.env.HUB_DRY_RUN = val;
+      _resetDryRunWarnedForTesting();
+      var result = await httpTransportSend(msg, {});
+      assert.equal(result.dry_run, true, 'expected dry_run for HUB_DRY_RUN=' + val);
+      delete process.env.HUB_DRY_RUN;
+    }
+  });
+
+  it('warning fires exactly once per process lifecycle', async () => {
+    process.env.HUB_DRY_RUN = '1';
+    _resetDryRunWarnedForTesting();
+    var warnCount = 0;
+    var origWarn = console.warn;
+    console.warn = function () {
+      if (String(arguments[0]).includes('HUB_DRY_RUN')) warnCount++;
+      origWarn.apply(console, arguments);
+    };
+    try {
+      var msg = buildMessage({ messageType: 'hello', payload: {} });
+      await httpTransportSend(msg, {});
+      await httpTransportSend(msg, {});
+      assert.equal(warnCount, 1, 'warning should fire exactly once');
+    } finally {
+      console.warn = origWarn;
+    }
+  });
+
+  it('returns {ok:false} when A2A_HUB_URL unset and HUB_DRY_RUN off', async () => {
+    delete process.env.HUB_DRY_RUN;
+    var savedUrl = process.env.A2A_HUB_URL;
+    delete process.env.A2A_HUB_URL;
+    try {
+      var msg = buildMessage({ messageType: 'hello', payload: {} });
+      var result = await httpTransportSend(msg, {});
+      assert.equal(result.ok, false);
+      assert.equal(result.error, 'A2A_HUB_URL not set');
+    } finally {
+      if (savedUrl === undefined) delete process.env.A2A_HUB_URL;
+      else process.env.A2A_HUB_URL = savedUrl;
+    }
+  });
+
+  it('_resetDryRunWarnedForTesting allows warning to fire again', async () => {
+    process.env.HUB_DRY_RUN = '1';
+    _resetDryRunWarnedForTesting();
+    var warnCount = 0;
+    var origWarn = console.warn;
+    console.warn = function () {
+      if (String(arguments[0]).includes('HUB_DRY_RUN')) warnCount++;
+      origWarn.apply(console, arguments);
+    };
+    try {
+      var msg = buildMessage({ messageType: 'hello', payload: {} });
+      await httpTransportSend(msg, {});
+      _resetDryRunWarnedForTesting();
+      await httpTransportSend(msg, {});
+      assert.equal(warnCount, 2, 'warning should fire again after reset');
+    } finally {
+      console.warn = origWarn;
+      _resetDryRunWarnedForTesting();
+    }
   });
 });

@@ -131,12 +131,27 @@ describe('runPreflightChecks', () => {
     const origQueue = process.env.EVOLVE_AGENT_QUEUE_MAX;
     process.env.EVOLVE_LOAD_MAX = '9999';
     process.env.EVOLVE_AGENT_QUEUE_MAX = '9999';
-    const result = await guards.runPreflightChecks(false, false);
-    assert.equal(result.abort, false);
-    if (origLoad === undefined) delete process.env.EVOLVE_LOAD_MAX;
-    else process.env.EVOLVE_LOAD_MAX = origLoad;
-    if (origQueue === undefined) delete process.env.EVOLVE_AGENT_QUEUE_MAX;
-    else process.env.EVOLVE_AGENT_QUEUE_MAX = origQueue;
+    // PR #46 added a .evolver.lock cooperative-yield gate. If the developer
+    // running tests has the lock present locally, this test would falsely
+    // report abort=true. Ensure no lock is present for this assertion.
+    const fs = require('fs');
+    const path = require('path');
+    const lockPath = path.join(process.cwd(), '.evolver.lock');
+    let restoreLock = false;
+    try {
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+        restoreLock = true;
+      }
+      const result = await guards.runPreflightChecks(false, false);
+      assert.equal(result.abort, false);
+    } finally {
+      if (restoreLock) fs.writeFileSync(lockPath, '');
+      if (origLoad === undefined) delete process.env.EVOLVE_LOAD_MAX;
+      else process.env.EVOLVE_LOAD_MAX = origLoad;
+      if (origQueue === undefined) delete process.env.EVOLVE_AGENT_QUEUE_MAX;
+      else process.env.EVOLVE_AGENT_QUEUE_MAX = origQueue;
+    }
   });
 
   it('returns { abort: true } when system load exceeds EVOLVE_LOAD_MAX', async () => {

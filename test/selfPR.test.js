@@ -253,7 +253,12 @@ describe('state management', () => {
     const origDebug = process.env.DEBUG;
     const origEvolutionDir = process.env.EVOLUTION_DIR;
     process.env.DEBUG = '1';
-    process.env.EVOLUTION_DIR = '/dev/null/selfpr-nested';
+    // Use a regular file as the parent so mkdirSync fails on all platforms
+    // (Unix /dev/null trick does not work on Windows where it resolves to a
+    // writable path and the write succeeds, suppressing the debug output).
+    const blocker = path.join(os.tmpdir(), 'selfpr-test-blocker-' + Date.now() + '.txt');
+    fs.writeFileSync(blocker, 'block');
+    process.env.EVOLUTION_DIR = path.join(blocker, 'nested');
 
     const origWrite = process.stderr.write;
     let captured = '';
@@ -267,6 +272,7 @@ describe('state management', () => {
       assert.ok(captured.includes('selfPR.writeState failed'), 'diagnostic line should be emitted under DEBUG');
     } finally {
       process.stderr.write = origWrite;
+      try { fs.rmSync(blocker, { force: true }); } catch (_) {}
       if (origDebug !== undefined) process.env.DEBUG = origDebug;
       else delete process.env.DEBUG;
       if (origEvolutionDir !== undefined) process.env.EVOLUTION_DIR = origEvolutionDir;

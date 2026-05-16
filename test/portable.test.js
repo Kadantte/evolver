@@ -55,7 +55,9 @@ describe('portable.exportGepx', () => {
 
     const extractDir = path.join(root, 'extract');
     fs.mkdirSync(extractDir, { recursive: true });
-    execFileSync('tar', ['-xzf', outputPath, '-C', extractDir]);
+    // Use cwd + relative path to avoid GNU tar on Windows misreading "C:" as
+    // a remote hostname when absolute paths are passed to -xzf or -C.
+    execFileSync('tar', ['-xzf', path.relative(extractDir, outputPath)], { cwd: extractDir });
 
     assert.ok(fs.existsSync(path.join(extractDir, 'manifest.json')));
     assert.ok(fs.existsSync(path.join(extractDir, 'checksum.sha256')));
