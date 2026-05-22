@@ -116,6 +116,74 @@ test('lifecycle reAuthenticate: suppresses re-entry while backoff window is acti
   assert.strictEqual(result, false);
 });
 
+test('lifecycle reAuthenticate: backoff escalates exponentially on consecutive failures', async () => {
+  // Without escalation a daemon stuck on a bad secret gets re-poked every
+  // 30 minutes by inbound auth errors and never gives the operator a clear
+  // signal that manual recovery is needed. Each consecutive failed re-auth
+  // doubles the backoff, capped near 4 hours.
+  const originalFetch = global.fetch;
+  try {
+    const mf = mockFetch(() => responseFromJson({
+      status: 200,
+      json: { payload: {} },
+    }));
+    global.fetch = mf;
+    const store = makeStore();
+    store.setState('node_id', 'node_test');
+    const mgr = new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+
+    // Failure #1 -> ~30 min
+    await mgr.reAuthenticate();
+    const firstBackoff = mgr._reauthBackoffUntil - Date.now();
+    assert.ok(firstBackoff > 25 * 60_000 && firstBackoff <= 30 * 60_000, `first failure ~30min, got ${firstBackoff}ms`);
+
+    // Pretend the window expired so we can drive a second failure.
+    mgr._reauthBackoffUntil = 0;
+    await mgr.reAuthenticate();
+    const secondBackoff = mgr._reauthBackoffUntil - Date.now();
+    assert.ok(secondBackoff > 50 * 60_000, `second failure must be > 50min, got ${secondBackoff}ms`);
+
+    // Drive a few more and verify the cap kicks in.
+    for (let i = 0; i < 6; i++) {
+      mgr._reauthBackoffUntil = 0;
+      await mgr.reAuthenticate();
+    }
+    const cappedBackoff = mgr._reauthBackoffUntil - Date.now();
+    assert.ok(cappedBackoff <= 4 * 60 * 60_000 + 1000, `backoff must cap at ~4h, got ${cappedBackoff}ms`);
+    assert.ok(cappedBackoff >= 4 * 60 * 60_000 - 5000, `backoff should hit the cap, got ${cappedBackoff}ms`);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('lifecycle reAuthenticate: successful re-auth resets the consecutive-failures counter', async () => {
+  const originalFetch = global.fetch;
+  const VALID_HEX64_NEW = 'b'.repeat(64);
+  try {
+    const store = makeStore();
+    store.setState('node_id', 'node_test');
+    const mgr = new LifecycleManager({ hubUrl: 'https://example.test', store, logger: silentLogger() });
+    mgr._consecutiveReauthFailures = 5; // pretend we have been failing a while
+
+    const mf = mockFetch((nthCall) => {
+      if (nthCall === 1) {
+        return responseFromJson({
+          status: 200,
+          json: { payload: { status: 'acknowledged', node_secret: VALID_HEX64_NEW, your_node_id: 'node_test' } },
+        });
+      }
+      return responseFromJson({ status: 200, json: { status: 'ok' } });
+    });
+    global.fetch = mf;
+
+    const result = await mgr.reAuthenticate();
+    assert.strictEqual(result, true);
+    assert.strictEqual(mgr._consecutiveReauthFailures, 0, 'success must reset the failure counter');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('lifecycle reAuthenticate: breaks on hello_rate_limited without retrying', async () => {
   const originalFetch = global.fetch;
   try {

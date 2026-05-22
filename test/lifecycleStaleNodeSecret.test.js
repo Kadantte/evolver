@@ -77,7 +77,10 @@ function responseFromJson({ status = 200, json = {}, headers = {} } = {}) {
   };
 }
 
-test('nodeSecret getter: env var wins over stale store value and rewrites store', () => {
+test('nodeSecret getter: env var wins over store with no source tag (legacy / first boot)', () => {
+  // Mirrors #529: store carries a legacy or env_seed value that has gone
+  // stale in the meantime, while the operator just exported a fresh secret
+  // in A2A_NODE_SECRET. With no source tag, env still wins and we re-sync.
   const original = process.env.A2A_NODE_SECRET;
   try {
     process.env.A2A_NODE_SECRET = VALID_HEX64_A;
@@ -89,6 +92,11 @@ test('nodeSecret getter: env var wins over stale store value and rewrites store'
 
     assert.strictEqual(resolved, VALID_HEX64_A, 'env value should win on conflict');
     assert.strictEqual(store.getState('node_secret'), VALID_HEX64_A, 'store should be re-synced');
+    assert.strictEqual(
+      store.getState('node_secret_source'),
+      'env_seed',
+      'env-resync must mark the new store value as env_seed'
+    );
     assert.ok(
       logger._calls.warn.some((m) => m.includes('A2A_NODE_SECRET env var differs')),
       'should warn the operator exactly once'
@@ -98,6 +106,46 @@ test('nodeSecret getter: env var wins over stale store value and rewrites store'
     mgr.nodeSecret;
     const warnCount = logger._calls.warn.filter((m) => m.includes('A2A_NODE_SECRET env var differs')).length;
     assert.strictEqual(warnCount, 1, 'override warning should be one-shot');
+  } finally {
+    if (original === undefined) delete process.env.A2A_NODE_SECRET;
+    else process.env.A2A_NODE_SECRET = original;
+  }
+});
+
+test('nodeSecret getter: store wins when its value was last written by hub_rotate', () => {
+  // Symmetric failure to #529. A previous daemon run rotated the secret via
+  // /a2a/hello (store now holds the hub-recognised value, tagged
+  // node_secret_source='hub_rotate'). After a daemon restart the parent
+  // shell still exports the *old* value of A2A_NODE_SECRET. Without
+  // source-tracking, env-wins would silently overwrite the rotated secret
+  // and trigger an irrecoverable 30-min auth backoff.
+  const original = process.env.A2A_NODE_SECRET;
+  try {
+    process.env.A2A_NODE_SECRET = VALID_HEX64_A;
+    const store = makeStore({
+      node_secret: VALID_HEX64_B,
+      node_secret_source: 'hub_rotate',
+    });
+    const logger = silentLogger();
+    const mgr = new LifecycleManager({ hubUrl: 'https://example.test', store, logger });
+
+    assert.strictEqual(mgr.nodeSecret, VALID_HEX64_B, 'hub-rotated store value must win');
+    assert.strictEqual(store.getState('node_secret'), VALID_HEX64_B, 'store must NOT be rewritten with stale env');
+    assert.strictEqual(
+      store.getState('node_secret_source'),
+      'hub_rotate',
+      'source tag must persist'
+    );
+    assert.ok(
+      logger._calls.warn.some((m) => m.includes('treating env as stale')),
+      'should warn that env was disregarded'
+    );
+
+    // Repeated reads do NOT re-log.
+    mgr.nodeSecret;
+    mgr.nodeSecret;
+    const warnCount = logger._calls.warn.filter((m) => m.includes('treating env as stale')).length;
+    assert.strictEqual(warnCount, 1, 'stale-env warning should be one-shot');
   } finally {
     if (original === undefined) delete process.env.A2A_NODE_SECRET;
     else process.env.A2A_NODE_SECRET = original;
@@ -173,6 +221,11 @@ test('reAuthenticate: drops cached secret and retries unauthenticated when hub r
       `second hello must NOT carry an Authorization header (got: ${JSON.stringify(secondHelloAuthHeader)})`
     );
     assert.strictEqual(store.getState('node_secret'), '', 'cached secret must be cleared');
+    assert.strictEqual(
+      store.getState('node_secret_source'),
+      '',
+      'source tag must be cleared too -- nothing in store, nothing to attribute'
+    );
     assert.ok(mgr._reauthBackoffUntil > Date.now(), '30-min backoff still set after manual reset path');
     assert.ok(
       store._inbound.some((e) => e?.payload?.action === 'manual_secret_reset_required'),
@@ -227,6 +280,11 @@ test('reAuthenticate: env var does NOT undo a successful rotation during verific
       'rotated secret must remain in store after verification heartbeat'
     );
     assert.strictEqual(
+      store.getState('node_secret_source'),
+      'hub_rotate',
+      'rotated secret must be tagged so the next daemon boot can ignore stale shell env'
+    );
+    assert.strictEqual(
       seenAuthHeaders[1],
       `Bearer ${VALID_HEX64_Z}`,
       `verification heartbeat must use the freshly rotated secret, not the stale env var (got ${seenAuthHeaders[1]})`
@@ -266,6 +324,11 @@ test('reAuthenticate: no manual_reset event when rotate eventually succeeds', as
 
     assert.strictEqual(result, true);
     assert.strictEqual(store.getState('node_secret'), VALID_HEX64_B, 'fresh secret persisted');
+    assert.strictEqual(
+      store.getState('node_secret_source'),
+      'hub_rotate',
+      'fresh secret must be tagged hub_rotate'
+    );
     assert.strictEqual(
       store._inbound.filter((e) => e?.payload?.action === 'manual_secret_reset_required').length,
       0,

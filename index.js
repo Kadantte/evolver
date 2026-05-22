@@ -1724,6 +1724,58 @@ async function main() {
       process.exit(1);
     }
 
+  } else if (command === 'reset-local-secret') {
+    // Wipe every local store of node_secret in one shot, so a daemon stuck
+    // after a manual web reset (https://evomap.ai/account -> Reset Secret)
+    // can boot clean. Three locations are involved:
+    //   - MailboxStore: ~/.evomap/mailbox/state.json key node_secret
+    //   - Legacy file:  ~/.evomap/node_secret
+    //   - Shell env:    A2A_NODE_SECRET (we cannot mutate the parent shell;
+    //                   we just print the unset hint)
+    const path = require('path');
+    const fs = require('fs');
+    const home = process.env.HOME || require('os').homedir();
+    const stateFile = path.join(home, '.evomap', 'mailbox', 'state.json');
+    const legacyFile = path.join(home, '.evomap', 'node_secret');
+    let cleared = 0;
+    try {
+      if (fs.existsSync(stateFile)) {
+        const raw = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+        let mutated = false;
+        for (const k of ['node_secret', 'node_secret_source']) {
+          if (raw[k] !== undefined && raw[k] !== '') {
+            raw[k] = '';
+            mutated = true;
+          }
+        }
+        if (mutated) {
+          fs.writeFileSync(stateFile, JSON.stringify(raw, null, 2) + '\n', 'utf8');
+          cleared += 1;
+          console.log('[reset-local-secret] cleared MailboxStore at ' + stateFile);
+        } else {
+          console.log('[reset-local-secret] MailboxStore had no node_secret to clear');
+        }
+      }
+      if (fs.existsSync(legacyFile)) {
+        fs.unlinkSync(legacyFile);
+        cleared += 1;
+        console.log('[reset-local-secret] removed legacy file ' + legacyFile);
+      }
+    } catch (err) {
+      console.error('[reset-local-secret] error:', err && err.message || err);
+      process.exit(1);
+    }
+    if (process.env.A2A_NODE_SECRET) {
+      console.log('');
+      console.log('[reset-local-secret] A2A_NODE_SECRET is still set in this shell.');
+      console.log('[reset-local-secret] Run:    unset A2A_NODE_SECRET');
+      console.log('[reset-local-secret] Or edit your shell rc / .env file before restarting the daemon.');
+    } else {
+      console.log('[reset-local-secret] A2A_NODE_SECRET is not set in env -- good.');
+    }
+    console.log('[reset-local-secret] ' + cleared + ' location(s) cleared. Restart the daemon to pick a fresh secret from the hub.');
+    process.exit(0);
+
   } else if (command === 'atp-complete') {
     // Invoked by a spawned Cursor sub-session after it has written the ATP
     // task answer to a file. Drives publish -> task/complete -> atp/deliver.

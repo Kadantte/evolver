@@ -8,6 +8,11 @@ const DEFAULT_HEARTBEAT_INTERVAL = 360_000;
 const HELLO_TIMEOUT = 15_000;
 const HEARTBEAT_TIMEOUT = 10_000;
 const MAX_REAUTH_ATTEMPTS = 2;
+// First failure = 30 min, subsequent consecutive failures double up to ~4h.
+// Without escalation a daemon stuck on a bad secret gets re-poked every 30
+// minutes by inbound auth errors and fills the log forever.
+const REAUTH_BACKOFF_BASE_MS = 30 * 60_000;
+const REAUTH_BACKOFF_MAX_MS = 4 * 60 * 60_000;
 
 let _cachedFingerprint = null;
 function _getEnvFingerprint() {
@@ -46,6 +51,7 @@ class LifecycleManager {
     this._reauthInProgress = false;
     this._helloRateLimitUntil = 0;
     this._reauthBackoffUntil = 0;
+    this._consecutiveReauthFailures = 0;
   }
 
   get nodeId() {
@@ -60,17 +66,28 @@ class LifecycleManager {
    * Resolve the active node_secret with conflict reconciliation between the
    * persistent MailboxStore and `process.env.A2A_NODE_SECRET`.
    *
-   * The store is normally authoritative because it is updated whenever
-   * /a2a/hello returns a fresh secret (including rotations). However, if the
-   * operator explicitly sets `A2A_NODE_SECRET` in the environment AND it
-   * disagrees with the stored value, the env var wins and we sync the store
-   * back to the env value. This breaks the failure mode reported in
-   * EvoMap/evolver#529 where a stale secret persisted in
-   * `~/.evomap/mailbox/state.json` keeps overriding a freshly minted secret
-   * exported from `.env`, producing an infinite re-auth loop:
-   *   stale store secret -> hello "OK" (lenient path) -> heartbeat 403
-   *   -> rotate_secret hello -> node_id_already_claimed (because the bearer
-   *   we sent could not prove ownership) -> 30-min backoff.
+   * Two opposite failure modes shape this logic:
+   *
+   *   #529 (env-fresh, store-stale): operator exports a freshly minted
+   *     secret in A2A_NODE_SECRET (e.g. from .env), but the MailboxStore
+   *     still holds a long-stale value. The store value would otherwise
+   *     win and produce a 403 -> rotate -> 30-min backoff loop.
+   *
+   *   "store-fresh, env-stale": process A rotates the secret via /a2a/hello,
+   *     so the store holds the value the hub now recognises. Process A then
+   *     restarts (typical: daemon respawn after upgrade or crash). The shell
+   *     it inherits its env from still exports the *previous* value of
+   *     A2A_NODE_SECRET. Without source-tracking we would treat this as
+   *     env-vs-store conflict, env-wins, and silently overwrite the
+   *     hub-recognised secret with a stale shell value -- exactly the loop
+   *     #529 was meant to fix, just symmetrical.
+   *
+   * Resolution: track *who wrote* the store value. When the hub returns a
+   * rotated secret (`hello`), we tag the store entry with
+   * `node_secret_source = 'hub_rotate'`. On conflict we honour that tag:
+   *
+   *   source=hub_rotate -> store wins (recent rotation; env is stale)
+   *   source missing/'env_seed' -> env wins (legacy / first-boot bootstrap)
    *
    * Single-source mode (only one of store/env present) is unchanged.
    * @returns {string|null}
@@ -80,11 +97,31 @@ class LifecycleManager {
       ? null
       : ((process.env.A2A_NODE_SECRET || '').trim() || null);
     const storeSecret = this.store.getState('node_secret') || null;
+    const storeSource = this.store.getState('node_secret_source') || null;
     const valid = (s) => typeof s === 'string' && /^[a-f0-9]{64}$/i.test(s);
 
     if (envSecret && storeSecret && envSecret !== storeSecret) {
+      // Store value came from a successful hub rotation -> trust it.
+      // The env var is necessarily stale: it was captured by the parent
+      // shell before the rotation and a child process cannot mutate it
+      // back into its parent.
+      if (storeSource === 'hub_rotate' && valid(storeSecret)) {
+        if (!this._storeSourceLogged) {
+          this._storeSourceLogged = true;
+          this.logger.warn(
+            '[lifecycle] A2A_NODE_SECRET env var differs from MailboxStore; ' +
+              'store value originated from a hub rotation, treating env as stale. ' +
+              'Run `evolver reset-local-secret` after a manual web reset, or ' +
+              'unset A2A_NODE_SECRET to silence this warning.'
+          );
+        }
+        return storeSecret;
+      }
       if (valid(envSecret)) {
         this.store.setState('node_secret', envSecret);
+        // Mark the new store value as env-seeded so a future rotation can
+        // distinguish "operator pasted this in" from "hub returned this".
+        this.store.setState('node_secret_source', 'env_seed');
         if (!this._envOverrideLogged) {
           this._envOverrideLogged = true;
           this.logger.warn(
@@ -167,6 +204,10 @@ class LifecycleManager {
       const secret = data?.payload?.node_secret || data?.node_secret || null;
       if (secret && /^[a-f0-9]{64}$/i.test(secret)) {
         this.store.setState('node_secret', secret);
+        // Tag the store entry so the next process that boots into a stale
+        // shell env can recognise this value as hub-authoritative and
+        // refuse to overwrite it (see _resolveNodeSecret above).
+        this.store.setState('node_secret_source', 'hub_rotate');
         // Hub just handed us a fresh secret. Whatever sits in
         // A2A_NODE_SECRET is now older than the store, so suppress the
         // env-wins reconciliation in _resolveNodeSecret for the rest of
@@ -239,6 +280,7 @@ class LifecycleManager {
         const hbResult = await this.heartbeat({ _skipReauth: true });
         if (hbResult.ok) {
           this.logger.log('[lifecycle] re-auth succeeded: heartbeat confirmed with new secret');
+          this._consecutiveReauthFailures = 0;
           // Note: _envOverrideLogged is intentionally NOT reset here.
           // The successful hello path above already set _suppressEnvSecret=true,
           // which means _resolveNodeSecret will never hit the env-vs-store
@@ -251,8 +293,17 @@ class LifecycleManager {
       if (manualResetRequired) {
         this._emitManualResetNeeded();
       }
-      this.logger.error('[lifecycle] re-auth exhausted all attempts, backing off for 30 minutes');
-      this._reauthBackoffUntil = Date.now() + 30 * 60_000;
+      this._consecutiveReauthFailures += 1;
+      const backoffMs = Math.min(
+        REAUTH_BACKOFF_BASE_MS * Math.pow(2, this._consecutiveReauthFailures - 1),
+        REAUTH_BACKOFF_MAX_MS
+      );
+      const backoffMin = Math.round(backoffMs / 60_000);
+      this.logger.error(
+        `[lifecycle] re-auth exhausted all attempts (failure #${this._consecutiveReauthFailures}), ` +
+          `backing off for ${backoffMin} minutes`
+      );
+      this._reauthBackoffUntil = Date.now() + backoffMs;
       return false;
     } finally {
       this._reauthInProgress = false;
@@ -268,6 +319,8 @@ class LifecycleManager {
   _dropLocalSecret(reason) {
     this.logger.warn(`[lifecycle] dropping cached node_secret (reason=${reason}); next hello will run unauthenticated`);
     try { this.store.setState('node_secret', ''); } catch { /* best-effort */ }
+    // Clear the source tag too -- nothing is stored, nothing to attribute.
+    try { this.store.setState('node_secret_source', ''); } catch { /* best-effort */ }
     // Suppress the env override for this process so _resolveNodeSecret stops
     // re-seeding the store with the same stale env value next call.
     this._suppressEnvSecret = true;
