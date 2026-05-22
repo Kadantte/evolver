@@ -377,6 +377,52 @@ describe('upsertCapsule / upsertGene validation (issue #30 H1)', () => {
   });
 });
 
+// Regression for issue #103: solidify mutates a Gene's epigenetic_marks /
+// learning_history in place and writes it back through upsertGene. Prior
+// to the fix, ensureSchemaFields only computed asset_id when missing, so
+// the stored Gene kept the pre-mutation hash and broke content addressing.
+describe('upsertGene asset_id freshness (issue #103)', () => {
+  beforeEach(setupTempEnv);
+  afterEach(teardownTempEnv);
+
+  it('recomputes asset_id when epigenetic_marks change in place', () => {
+    const { upsertGene, loadGenes } = freshRequire();
+    const { computeAssetId, verifyAssetId } = require('../src/gep/contentHash');
+
+    const gene = {
+      type: 'Gene',
+      schema_version: '1.6.0',
+      id: 'gene_epi_mut',
+      category: 'repair',
+      signals_match: ['log_error'],
+      strategy: ['try fix', 'rerun tests'],
+      validation: ['node -e "1"'],
+      constraints: { max_files: 10, forbidden_paths: ['.git', 'node_modules'] },
+      epigenetic_marks: [],
+    };
+    upsertGene(gene);
+    const original = loadGenes().find(g => g.id === 'gene_epi_mut');
+    assert.ok(original, 'gene should persist');
+    assert.ok(verifyAssetId(original), 'first write must verify');
+    const firstId = original.asset_id;
+
+    // Simulate solidify's in-place epigenetic mark mutation.
+    original.epigenetic_marks.push({
+      context: 'linux/x64/v22.0.0',
+      boost: 0.1,
+      reason: 'success_in_environment',
+      created_at: '2026-05-22T00:00:00.000Z',
+    });
+    upsertGene(original);
+
+    const reloaded = loadGenes().find(g => g.id === 'gene_epi_mut');
+    assert.ok(reloaded, 'gene should still be persisted after mutation');
+    assert.notEqual(reloaded.asset_id, firstId, 'asset_id must change when content changes');
+    assert.ok(verifyAssetId(reloaded), 'mutated gene must round-trip through verifyAssetId');
+    assert.equal(reloaded.asset_id, computeAssetId(reloaded));
+  });
+});
+
 describe('getLastEventId', () => {
   beforeEach(setupTempEnv);
   afterEach(teardownTempEnv);

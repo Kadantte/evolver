@@ -509,9 +509,26 @@ function ensureSchemaFields(obj) {
   return obj;
 }
 
+// Recompute asset_id from current content. Called on the Gene write path
+// because solidify mutates epigenetic_marks / learning_history in place
+// (see src/gep/solidify.js applyEpigeneticMarks + adaptGeneFromLearning),
+// which would otherwise leave a stale content hash on disk -- breaking
+// content addressing, dedup, and any tamper check that re-verifies
+// asset_id against the persisted Gene. See issue #103.
+function recomputeAssetId(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  try {
+    obj.asset_id = computeAssetId(obj);
+  } catch (e) {
+    console.warn('[AssetStore] Failed to recompute asset ID:', e && e.message || e);
+  }
+  return obj;
+}
+
 function upsertGene(geneObj) {
   _validateAssetWarn('Gene', validateGene, geneObj);
   ensureSchemaFields(geneObj);
+  recomputeAssetId(geneObj);
   ensureGenesSeeded();
   return withFileLock(genesPath(), () => {
     const current = readJsonIfExists(genesPath(), getDefaultGenes());

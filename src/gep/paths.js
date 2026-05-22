@@ -224,6 +224,84 @@ function getEvolverInstallRoot() {
   return path.resolve(__dirname, '..', '..');
 }
 
+// Per-workspace random secret used to attest that a memory_graph.jsonl
+// entry was written by the same workspace that's now reading it. Stored
+// at <workspace>/.evolver/workspace-id with mode 0600 and lazily created
+// on first call. Returns null on read/write errors so callers can fall
+// back to legacy cwd-tag matching.
+//
+// Why this exists: when memory_graph.jsonl lives at the user-level path
+// (~/.evolver/memory/evolution/memory_graph.jsonl, used by npm-global
+// installs), it's shared across every workspace under the same uid. The
+// PR #108 cwd-tag layer scopes reads to the current cwd, but `cwd` is a
+// plain-text self-report — any process writing the shared file can
+// claim a different workspace. workspace-id replaces that self-report
+// with a secret that only the legitimate workspace's evolver knows
+// (Bugbot PR #108 round-3 Agentic Security Review MEDIUM).
+function getWorkspaceId() {
+  if (process.env.EVOLVER_WORKSPACE_ID) return String(process.env.EVOLVER_WORKSPACE_ID);
+  const dir = path.join(getWorkspaceRoot(), '.evolver');
+  const file = path.join(dir, 'workspace-id');
+
+  // Refuse to follow symlinks at either the directory or file level.
+  // A malicious repo can pre-place `.evolver` or `.evolver/workspace-id`
+  // as a symlink to an attacker-chosen path outside the workspace, and
+  // mkdirSync({recursive:true}) / writeFileSync would silently follow
+  // it — clobbering the linked file with the secret payload (Bugbot PR
+  // #109 round-2 HIGH, Agentic Security Review).
+  try {
+    const dirStat = fs.lstatSync(dir, { throwIfNoEntry: false });
+    if (dirStat && dirStat.isSymbolicLink()) return null;
+    const fileStat = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (fileStat) {
+      if (fileStat.isSymbolicLink() || !fileStat.isFile()) return null;
+      try {
+        const raw = fs.readFileSync(file, 'utf8').trim();
+        if (raw && /^[a-f0-9]{32,}$/i.test(raw)) return raw;
+      } catch { /* unreadable — fall through to recreate */ }
+    }
+  } catch { /* fall through to create */ }
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const id = require('crypto').randomBytes(16).toString('hex');
+    // Atomic create-and-fail-if-exists so we never overwrite an
+    // attacker-pre-placed file (TOCTOU between lstat and writeFileSync
+    // could otherwise race a symlink in). O_NOFOLLOW also refuses to
+    // follow a symlink that appears between the lstat and open. Both
+    // flags exist on Linux/macOS; on Windows O_NOFOLLOW is silently
+    // ignored, but Windows has no symlink-by-default risk.
+    const flags = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL |
+      (fs.constants.O_NOFOLLOW || 0);
+    let fd;
+    try {
+      fd = fs.openSync(file, flags, 0o600);
+    } catch (e) {
+      // EEXIST means another process beat us to it — re-read with the
+      // same symlink guards as above.
+      if (e && e.code === 'EEXIST') {
+        const fileStat = fs.lstatSync(file, { throwIfNoEntry: false });
+        if (!fileStat || fileStat.isSymbolicLink() || !fileStat.isFile()) return null;
+        try {
+          const raw = fs.readFileSync(file, 'utf8').trim();
+          if (raw && /^[a-f0-9]{32,}$/i.test(raw)) return raw;
+        } catch { /* unreadable */ }
+        return null;
+      }
+      // ELOOP / EMLINK from O_NOFOLLOW hitting a symlink — refuse.
+      return null;
+    }
+    try {
+      fs.writeSync(fd, id + '\n', 0, 'utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    try { fs.chmodSync(file, 0o600); } catch { /* best-effort */ }
+    return id;
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   getRepoRoot,
   getEvolverInstallRoot,
@@ -236,6 +314,7 @@ module.exports = {
   getSkillsDir,
   getSessionScope,
   getAgentSessionsDir,
+  getWorkspaceId,
   readSessionCwdFromHead,
   getNarrativePath,
   getEvolutionPrinciplesPath,

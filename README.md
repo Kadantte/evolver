@@ -136,10 +136,31 @@ Evolver integrates with major agent runtimes through `setup-hooks`. Run it once 
 |---|---|---|
 | [Cursor](https://cursor.com) | `evolver setup-hooks --platform=cursor` | `~/.cursor/hooks.json` + scripts in `~/.cursor/hooks/`. Restart Cursor or open a new session. Fires on `sessionStart`, `afterFileEdit`, `stop`. |
 | [Claude Code](https://www.anthropic.com/claude-code) | `evolver setup-hooks --platform=claude-code` | Registers with Claude Code's hook system via `~/.claude/`. Restart the Claude Code CLI. |
-| [Codex](https://github.com/openai/codex) | `evolver setup-hooks --platform=codex` | `~/.codex/hooks.json` + scripts in `~/.codex/hooks/`, enables `codex_hooks` feature in `config.toml`. Restart the Codex CLI. |
+| [Codex](https://github.com/openai/codex) | `evolver setup-hooks --platform=codex` | `~/.codex/hooks.json` + scripts in `~/.codex/hooks/`, enables `codex_hooks` feature in `config.toml`. Restart the Codex CLI. See [Codex caveats](#codex-caveats) below. |
 | [Kiro](https://kiro.dev) | `evolver setup-hooks --platform=kiro` | Three `*.kiro.hook` files + scripts in `~/.kiro/hooks/`. Auto-discovered, no restart needed. |
 | [opencode](https://opencode.ai) | `evolver setup-hooks --platform=opencode` | Plugin at `~/.opencode/plugins/evolver.js` + scripts in `~/.opencode/hooks/`. Restart opencode. |
 | [OpenClaw](https://openclaw.com) | No setup needed | OpenClaw natively interprets the `sessions_spawn(...)` stdout directives Evolver emits. Just run `evolver` from inside an OpenClaw session. |
+
+#### Codex caveats
+
+The Codex CLI exposes `SessionStart` / `Stop` / `PostToolUse` hooks (which is
+how `setup-hooks --platform=codex` wires Evolver in), but it does **not**
+emit a session transcript file the way Cursor / Claude Code / opencode do.
+That means `evolver --review` cannot read raw session logs on Codex.
+
+Evolver compensates by reading, in order:
+
+1. `MEMORY.md` / `USER.md` in the workspace root (if you maintain them);
+2. the `<!-- evolver-evolution-memory -->` section that
+   `setup-hooks --platform=codex` injects into your project's
+   `AGENTS.md`;
+3. the tail of the local `memory_graph.jsonl` (the per-cycle outcome log
+   that Evolver writes itself).
+
+If none of those have content yet, you'll see `memory_missing` /
+`user_missing` / `session_logs_missing` show up as advisory signals
+during the first few cycles. They will go quiet on their own as
+`memory_graph.jsonl` accumulates outcomes — no manual setup required.
 
 ## Run from Source (Contributors Only)
 

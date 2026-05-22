@@ -2,15 +2,39 @@
 // evolver-session-end.js
 // Records evolution outcome at session end.
 // Collects git diff stats, extracts signals, records via Hub API or local memory.
-// Input: stdin JSON. Output: stdout JSON with followup_message.
+// Input: stdin JSON. Output: stdout JSON with `systemMessage` (Claude Code Stop
+// hook notification) — or empty `{}` on Cursor where systemMessage is mishandled.
 
 const fs = require('fs');
+const path = require('path');
+const os = require('os');
 const { spawnSync } = require('child_process');
 // 10 MB — prevents RangeError on large child process output (e.g. git log/diff
 // on large repos). See GHSA reports / issue #451.
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
 
+const path = require('path');
 const { findEvolverRoot, findMemoryGraph } = require('./_runtimePaths');
+
+// Workspace-id must use the same resolution as the reader in
+// src/evolve/pipeline/collect.js (which goes through src/gep/paths.js#
+// getWorkspaceRoot()). Otherwise writer and reader could land on
+// different `.evolver/workspace-id` files when EVOLVER_REPO_ROOT or
+// OPENCLAW_WORKSPACE is set, or when a `<repoRoot>/workspace`
+// subdirectory exists — in which case the IDs would never match and
+// every memory-graph entry would silently get dropped (Bugbot PR #109
+// round-1 MEDIUM). Lazy-load the canonical resolver from the resolved
+// evolver root; fall back to env-only when paths.js is unreachable.
+function resolveWorkspaceIdForWriter() {
+  if (process.env.EVOLVER_WORKSPACE_ID) return String(process.env.EVOLVER_WORKSPACE_ID);
+  const evolverRoot = findEvolverRoot();
+  if (!evolverRoot) return null;
+  try {
+    const paths = require(path.join(evolverRoot, 'src', 'gep', 'paths.js'));
+    if (typeof paths.getWorkspaceId === 'function') return paths.getWorkspaceId();
+  } catch { /* paths.js unreachable — return null */ }
+  return null;
+}
 
 function runGit(args, cwd) {
   // Argv-array form, no shell. Avoids POSIX `2>/dev/null` redirects that
@@ -50,6 +74,31 @@ function getGitDiffStats() {
     diffSnippet: diffContent.slice(0, 2000),
     hasChanges: stat.length > 0,
   };
+}
+
+// Detect whether the hook is running inside Cursor.
+//
+// Why: Claude Code's Stop hook spec says `systemMessage` is a notification
+// shown to the user and is NOT fed back into Claude's context. Cursor's
+// Claude Code-compatible runtime currently splices it into the next
+// inference round as if it were a user prompt, so Claude "responds" to the
+// evolution receipt — visible to users as an unexplained extra reasoning
+// turn after every task. Until Cursor fixes this, suppress systemMessage
+// on Cursor while keeping the local-memory append intact.
+//
+// Detection (any of):
+//   - TERM_PROGRAM=cursor
+//   - CURSOR_TRACE_ID / CURSOR_SESSION_ID set
+//   - EVOLVER_HOOK_HOST=cursor (manual override)
+// Escape hatch: EVOLVER_HOOK_VERBOSE=1 forces the message on regardless.
+function isCursorHost() {
+  const verbose = String(process.env.EVOLVER_HOOK_VERBOSE || '').toLowerCase();
+  if (verbose === '1' || verbose === 'true') return false;
+  if (String(process.env.EVOLVER_HOOK_HOST || '').toLowerCase() === 'cursor') return true;
+  if (String(process.env.TERM_PROGRAM || '').toLowerCase() === 'cursor') return true;
+  if (process.env.CURSOR_TRACE_ID) return true;
+  if (process.env.CURSOR_SESSION_ID) return true;
+  return false;
 }
 
 function detectSignals(text) {
@@ -113,6 +162,21 @@ function recordToLocal(graphPath, outcome) {
         score: outcome.score,
         note: outcome.summary,
       },
+      // Tag the originating workspace so the review-time reader in
+      // collect.js can scope user-level fallback entries to the current
+      // cwd. Without this, two unrelated projects sharing the user-level
+      // fallback file (~/.evolver/memory/evolution/memory_graph.jsonl,
+      // used by npm-global installs) would cross-pollinate each other's
+      // review context — a prompt-injection / disclosure surface flagged
+      // by Bugbot on PR #105 round-2.
+      //
+      // workspace_id is the forge-resistant tag (PR #108 round-3): the
+      // reader compares it against the secret in the workspace's own
+      // .evolver/workspace-id file. cwd is retained as a backward-compat
+      // tag so older entries written before this hardening still pass
+      // the cwd check.
+      cwd: process.cwd(),
+      workspace_id: resolveWorkspaceIdForWriter(),
       source: 'hook:session-end',
     };
     fs.appendFileSync(graphPath, JSON.stringify(entry) + '\n', 'utf8');
@@ -125,16 +189,23 @@ function recordToLocal(graphPath, outcome) {
 function main() {
   let inputData = '';
   let handled = false;
+  let watchdog = null;
+  const finish = (payload) => {
+    if (handled) return;
+    handled = true;
+    if (watchdog) clearTimeout(watchdog);
+    process.stdout.write(JSON.stringify(payload || {}));
+    process.exit(0);
+  };
   process.stdin.setEncoding('utf8');
   process.stdin.on('data', chunk => { inputData += chunk; });
   process.stdin.on('end', () => {
     if (handled) return;
-    handled = true;
     try {
       const diffInfo = getGitDiffStats();
 
       if (!diffInfo.hasChanges) {
-        process.stdout.write(JSON.stringify({}));
+        finish({});
         return;
       }
 
@@ -162,22 +233,46 @@ function main() {
       const target = hubOk ? 'Hub' : localOk ? 'local memory' : 'nowhere (no Hub or local path)';
       const msg = `[Evolution] Session outcome recorded to ${target}: ${outcome.summary}`;
 
-      process.stdout.write(JSON.stringify({
-        followup_message: msg,
-        stopMessage: msg,
-        additionalContext: msg,
-      }));
+      // Stop hook output schema (per Claude Code docs):
+      //   - decision: "approve" | "block"
+      //   - reason: string (shown when decision is set)
+      //   - systemMessage: string (notification displayed to user)
+      //   - continue: boolean
+      //   - stopReason: string
+      //
+      // Earlier versions emitted `followup_message`, `stopMessage`, and
+      // `additionalContext` together. `followup_message` is the field that
+      // re-injects the receipt into Claude's next inference round, which
+      // caused the agent to "respond" to its own evolution log line —
+      // visible to users as an unexplained extra reasoning turn after
+      // every task. The evolver is supposed to be observational, so we
+      // now use `systemMessage` only — that surfaces the receipt to the
+      // user without forcing another inference round.
+      //
+      // Cursor compatibility: Cursor's Claude Code-compatible runtime
+      // currently treats `systemMessage` as a user prompt for the next
+      // inference round. When we detect Cursor, omit systemMessage too.
+      // The receipt is always appended to ~/.evolver/logs/evolution.log
+      // so it is never silently lost; users can opt back in to the inline
+      // notification with EVOLVER_HOOK_VERBOSE=1.
+      try {
+        const logDir = process.env.EVOLVER_HOOK_LOG_DIR
+          || path.join(os.homedir(), '.evolver', 'logs');
+        fs.mkdirSync(logDir, { recursive: true });
+        fs.appendFileSync(
+          path.join(logDir, 'evolution.log'),
+          `${new Date().toISOString()} ${msg}\n`,
+          'utf8'
+        );
+      } catch { /* best-effort, never break the hook on log write */ }
+
+      finish(isCursorHost() ? {} : { systemMessage: msg });
     } catch (e) {
-      process.stdout.write(JSON.stringify({}));
+      finish({});
     }
   });
 
-  setTimeout(() => {
-    if (handled) return;
-    handled = true;
-    process.stdout.write(JSON.stringify({}));
-    process.exit(0);
-  }, 7000);
+  watchdog = setTimeout(() => finish({}), 7000);
 }
 
 main();

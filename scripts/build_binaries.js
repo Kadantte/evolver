@@ -208,13 +208,15 @@ if (!OPTS.skipObfuscate) {
   if (!OPTS.dryRun) {
     const O = require(require.resolve('javascript-obfuscator', { paths: [REPO_ROOT] }));
     const src = fs.readFileSync(BUNDLED_JS, 'utf8');
-    // Deterministic obfuscation: same release version + same source = same
-    // output. This makes binary diffs across re-runs meaningful and lets
-    // SHA256SUMS be reproduced by anyone with the source tree.
-    const seed = parseInt(crypto.createHash('sha256').update(`evolver:${releaseVersion}`).digest('hex').slice(0, 8), 16);
-    const t0 = Date.now();
-    const result = O.obfuscate(src, {
-      seed,
+    // Seed obfuscation from release version: gives same-version reruns a
+    // narrow PRNG path, but the obfuscator has internal non-determinism
+    // beyond the seed (Set iteration / stringArray rotation timing) so two
+    // runs with the same seed can still differ slightly. Empirically ~5%
+    // of those runs emit invalid syntax (e.g. mangling `new.target` to
+    // `#target`, which then crashes `bun compile`). Validate after each
+    // attempt and retry — see RETRY note in pipeline rationale below.
+    const baseSeed = parseInt(crypto.createHash('sha256').update(`evolver:${releaseVersion}`).digest('hex').slice(0, 8), 16);
+    const obfOpts = {
       compact: true,
       controlFlowFlattening: true,
       controlFlowFlatteningThreshold: 0.75,
@@ -237,12 +239,49 @@ if (!OPTS.skipObfuscate) {
       numbersToExpressions: true,
       unicodeEscapeSequence: true,
       target: 'node',
-    });
-    fs.writeFileSync(OBF_JS, result.getObfuscatedCode());
-    const obfSize = fs.statSync(OBF_JS).size;
-    console.log(`  obfuscation: ${((Date.now() - t0) / 1000).toFixed(1)}s, output ${(obfSize / 1024 / 1024).toFixed(2)} MB`);
+    };
+
+    const MAX_OBF_ATTEMPTS_RAW = process.env.OBF_MAX_ATTEMPTS;
+    const MAX_OBF_ATTEMPTS = MAX_OBF_ATTEMPTS_RAW === undefined
+      ? 4
+      : parseInt(MAX_OBF_ATTEMPTS_RAW, 10);
+    if (!Number.isInteger(MAX_OBF_ATTEMPTS) || MAX_OBF_ATTEMPTS < 1) {
+      console.error(`  ERROR: OBF_MAX_ATTEMPTS must be a positive integer; got ${JSON.stringify(MAX_OBF_ATTEMPTS_RAW)}.`);
+      process.exit(1);
+    }
+    let attempt = 0;
+    let usedSeed = baseSeed;
+    let lastValidationErr = null;
+    let succeeded = false;
+    while (attempt < MAX_OBF_ATTEMPTS) {
+      attempt++;
+      // Perturb seed on retries to dodge a stuck PRNG path. Attempt 1 keeps
+      // the canonical seed for best-effort reproducibility; later attempts
+      // shift by attempt index so the next deploy gets a fresh trajectory.
+      usedSeed = baseSeed + (attempt - 1);
+      const t0 = Date.now();
+      const result = O.obfuscate(src, { ...obfOpts, seed: usedSeed });
+      fs.writeFileSync(OBF_JS, result.getObfuscatedCode());
+      const obfSize = fs.statSync(OBF_JS).size;
+      const obfSecs = ((Date.now() - t0) / 1000).toFixed(1);
+
+      const check = spawnSync('node', ['--check', OBF_JS], { encoding: 'utf8' });
+      if (check.status === 0) {
+        console.log(`  obfuscation: ${obfSecs}s, output ${(obfSize / 1024 / 1024).toFixed(2)} MB (attempt ${attempt}/${MAX_OBF_ATTEMPTS}, seed=0x${usedSeed.toString(16)})`);
+        succeeded = true;
+        break;
+      }
+      lastValidationErr = (check.stderr || check.stdout || '').split('\n').slice(0, 3).join(' | ');
+      console.warn(`  attempt ${attempt}/${MAX_OBF_ATTEMPTS}: obfuscator output failed node --check (${lastValidationErr.slice(0, 200)}); retrying with perturbed seed...`);
+    }
+    if (!succeeded) {
+      console.error(`  ERROR: javascript-obfuscator produced syntactically invalid output in ${MAX_OBF_ATTEMPTS} attempts.`);
+      console.error(`         last error: ${lastValidationErr || '(none — loop did not run)'}`);
+      console.error(`         raise OBF_MAX_ATTEMPTS env var to retry more times, or temporarily run with --skip-obfuscate.`);
+      process.exit(2);
+    }
   } else {
-    console.log('  [dry-run] would obfuscate stage/bundled.js -> stage/bundled.obf.js');
+    console.log('  [dry-run] would obfuscate stage/bundled.js -> stage/bundled.obf.js (with retry-on-syntax-error)');
   }
 
   payloadJs = OBF_JS;
@@ -385,4 +424,22 @@ console.log('  next: gh release upload v<ver> dist-binaries/* --repo EvoMap/evol
 //   (qemu-user-static on linux, Rosetta on darwin-x64-on-arm64). CI/CD
 //   in GitHub Actions on `runs-on: macos-latest, ubuntu-latest` should
 //   set up the matrix so each runner smoke-tests its own native target.
+//
+// Stage 2 retry-on-syntax-error (added 2026-05-22, v1.85.0 deploy
+// post-mortem):
+//
+//   The v1.85.0 release deploy hit `bun compile` failing with
+//   `Expected "in" but found ","` at offset ~1.5MB into bundled.obf.js.
+//   The failing region contained `(#target,this)` — javascript-obfuscator
+//   had mangled `new.target` into `#target` (a private class field syntax
+//   that's only legal inside a class body). A from-scratch rebuild on the
+//   same source + seed produced a different output (15.18 MB vs 15.14 MB)
+//   that compiled cleanly, confirming the obfuscator has internal
+//   non-determinism beyond the user-supplied seed.
+//
+//   Mitigation: after each obfuscation attempt, run `node --check` on the
+//   output; if syntax is invalid, perturb the seed by +attempt and retry
+//   up to OBF_MAX_ATTEMPTS times (default 4). Cost of validation is
+//   ~1 second on 15 MB; cost of catching the failure here vs after a
+//   doomed bun compile pass is roughly 50s saved per failure.
 //
