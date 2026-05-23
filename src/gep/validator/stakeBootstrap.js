@@ -27,9 +27,9 @@
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const { buildHubHeaders, getHubUrl, getNodeId } = require('../a2aProtocol');
 const { hubFetch } = require('../hubFetch');
+const { getEvomapPath } = require('../paths');
 const { resolveHubUrl: resolveDefaultHubUrl } = require('../../config');
 
 const DEFAULT_STAKE_AMOUNT = Number(process.env.EVOLVER_VALIDATOR_STAKE_AMOUNT) || 100;
@@ -92,10 +92,8 @@ let _state = {
 // "already active" responses + rate-limit suppressions on the Hub.
 // We now carry the retry clock between process invocations.
 
-const STATE_FILE = path.join(
-  process.env.EVOLVER_HOME || path.join(os.homedir(), '.evomap'),
-  'validator_stake_state.json',
-);
+// Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
+function _stateFile() { return getEvomapPath('validator_stake_state.json'); }
 
 let _stateLoaded = false;
 
@@ -103,8 +101,9 @@ function _loadStateFromDisk() {
   if (_stateLoaded) return;
   _stateLoaded = true;
   try {
-    if (!fs.existsSync(STATE_FILE)) return;
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const file = _stateFile();
+    if (!fs.existsSync(file)) return;
+    const raw = fs.readFileSync(file, 'utf8');
     if (!raw) return;
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return;
@@ -135,7 +134,8 @@ function _loadStateFromDisk() {
 
 function _persistState() {
   try {
-    const dir = path.dirname(STATE_FILE);
+    const file = _stateFile();
+    const dir = path.dirname(file);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
@@ -147,7 +147,7 @@ function _persistState() {
       // disabledUntilRestart intentionally omitted
       savedAt: Date.now(),
     };
-    fs.writeFileSync(STATE_FILE, JSON.stringify(snapshot), { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(file, JSON.stringify(snapshot), { encoding: 'utf8', mode: 0o600 });
   } catch (_) {
     // best-effort: ignore disk failures (e.g. read-only FS in sandbox)
   }
@@ -327,7 +327,7 @@ function _resetStateForTests() {
     disabledUntilRestart: false,
   };
   _stateLoaded = false;
-  try { fs.unlinkSync(STATE_FILE); } catch (_) {}
+  try { fs.unlinkSync(_stateFile()); } catch (_) {}
 }
 
 function _getStateForTests() {
@@ -340,7 +340,8 @@ module.exports = {
   BACKOFF_STEPS_TRANSIENT_MS,
   BACKOFF_STEPS_FUNDS_MS,
   SUCCESS_RECHECK_MS,
-  STATE_FILE,
+  // Getter so callers see the current EVOLVER_HOME at call time (#114).
+  get STATE_FILE() { return _stateFile(); },
   _resetStateForTests,
   _getStateForTests,
   _loadStateFromDisk,

@@ -520,3 +520,145 @@ describe('readSessionCwdFromHead', () => {
     assert.equal(readSessionCwdFromHead(file, 4096), '/ok');
   });
 });
+
+// ---------------------------------------------------------------------------
+// #541 — getRepoRoot must not escape `node_modules` when walking upward from
+// the evolver install. On macOS with Homebrew, the global install lives at
+// `/opt/homebrew/lib/node_modules/@evomap/evolver` and `/opt/homebrew` is
+// itself a git repo, so an unbounded upward walk used to resolve repoRoot
+// to `/opt/homebrew` for any user who didn't `cd` into a git project first.
+//
+// These tests can't reuse the in-process `freshRequire('../src/gep/paths')`
+// trick because that path's `__dirname` is always the real repo's
+// `src/gep/`. We have to copy paths.js into a fake `node_modules` install
+// layout and spawn a child node process so its `__dirname` lands inside the
+// boundary we want to verify.
+// ---------------------------------------------------------------------------
+describe('getRepoRoot node_modules boundary (#541)', () => {
+  const { spawnSync } = require('child_process');
+
+  function setupFakeGlobalInstall() {
+    // Layout mirroring `npm install -g @evomap/evolver` on macOS Homebrew:
+    //   <root>/.git/                                        ← outer git that
+    //                                                         must NOT be picked
+    //   <root>/lib/node_modules/@evomap/evolver/             ← fake install
+    //   <root>/lib/node_modules/@evomap/evolver/src/gep/paths.js
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-541-global-'));
+    fs.mkdirSync(path.join(root, '.git'));
+    const installDir = path.join(root, 'lib', 'node_modules', '@evomap', 'evolver');
+    const gepDir = path.join(installDir, 'src', 'gep');
+    fs.mkdirSync(gepDir, { recursive: true });
+    fs.copyFileSync(
+      path.resolve(__dirname, '..', 'src', 'gep', 'paths.js'),
+      path.join(gepDir, 'paths.js')
+    );
+    return { root, installDir };
+  }
+
+  function setupFakeLocalInstall() {
+    // Layout mirroring local `npm install @evomap/evolver` in a user project:
+    //   <root>/.git/                                        ← user's project git
+    //   <root>/node_modules/@evomap/evolver/                ← fake install
+    //   <root>/node_modules/@evomap/evolver/src/gep/paths.js
+    // Here we DO want the walk to find <root>/.git.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-541-local-'));
+    fs.mkdirSync(path.join(root, '.git'));
+    const installDir = path.join(root, 'node_modules', '@evomap', 'evolver');
+    const gepDir = path.join(installDir, 'src', 'gep');
+    fs.mkdirSync(gepDir, { recursive: true });
+    fs.copyFileSync(
+      path.resolve(__dirname, '..', 'src', 'gep', 'paths.js'),
+      path.join(gepDir, 'paths.js')
+    );
+    return { root, installDir };
+  }
+
+  function runGetRepoRootIn(installDir, cwd) {
+    const script = `
+      const { getRepoRoot } = require(${JSON.stringify(path.join(installDir, 'src', 'gep', 'paths.js'))});
+      process.stdout.write(getRepoRoot());
+    `;
+    const env = { ...process.env };
+    // Strip env that would short-circuit the upward walk we want to exercise.
+    delete env.EVOLVER_REPO_ROOT;
+    delete env.EVOLVER_USE_PARENT_GIT;
+    delete env.EVOLVER_NO_PARENT_GIT;
+    env.EVOLVER_QUIET_PARENT_GIT = '1';
+    const res = spawnSync(process.execPath, ['-e', script], { cwd, env, encoding: 'utf8' });
+    if (res.status !== 0) {
+      throw new Error(`child failed: ${res.stderr || res.stdout}`);
+    }
+    return res.stdout;
+  }
+
+  it('global-install layout: does not escape past node_modules to outer .git', () => {
+    const { root, installDir } = setupFakeGlobalInstall();
+    // cwd is an isolated empty tmp dir with no `.git` anywhere up — guarantees
+    // step 2 (cwd walk) returns nothing, so the test actually exercises step 3.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-541-cwd-'));
+    try {
+      const resolved = runGetRepoRootIn(installDir, cwd);
+      assert.notEqual(resolved, root,
+        `regressed: walk escaped node_modules and picked outer .git at ${root}`);
+      // Expected fallback: ownDir (the install itself) since no .git was
+      // found within the boundary.
+      assert.equal(resolved, installDir);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('local-install layout: still finds the user project .git just above node_modules', () => {
+    const { root, installDir } = setupFakeLocalInstall();
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'evolver-541-cwd-'));
+    try {
+      const resolved = runGetRepoRootIn(installDir, cwd);
+      // The boundary INCLUDES the parent of node_modules (i.e. the user's
+      // project), so <root>/.git is reachable and must be picked.
+      assert.equal(resolved, root,
+        `regression: local install no longer finds the project's own .git`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('reporter verify snippet: cwd INSIDE the install dir must not escape via cwd walk', () => {
+    // The pre-fix step-3 boundary alone did not cover this case: the
+    // reporter's exact reproduction (#541) did `cd` into the global
+    // install dir before running, which made the cwd walk (step 2) find
+    // `/opt/homebrew/.git` BEFORE the bounded step-3 walk could run.
+    // Step 2 now applies the same node_modules boundary.
+    const { root, installDir } = setupFakeGlobalInstall();
+    try {
+      // cwd == install dir, NOT an isolated tmp dir. Reproduces:
+      //   cd /opt/homebrew/lib/node_modules/@evomap/evolver && evolver ...
+      const resolved = runGetRepoRootIn(installDir, installDir);
+      assert.notEqual(resolved, root,
+        `regression: cwd walk escaped node_modules and picked outer .git at ${root}`);
+      assert.equal(resolved, installDir);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('cwd inside a user-project node_modules sub-dir still resolves to the project root', () => {
+    // Real-world case: user `cd`s into `<their-project>/node_modules/lodash`
+    // (or any sub-dir of their project's node_modules). The boundary
+    // includes the parent of node_modules, so the walk must still find
+    // `<their-project>/.git`. Verifies the cwd-walk boundary doesn't
+    // over-correct.
+    const { root, installDir } = setupFakeLocalInstall();
+    // Create a sibling package dir under the same node_modules to cd into.
+    const sibling = path.join(root, 'node_modules', 'lodash');
+    fs.mkdirSync(sibling, { recursive: true });
+    try {
+      const resolved = runGetRepoRootIn(installDir, sibling);
+      assert.equal(resolved, root,
+        `regression: user cd'd into project's node_modules sub-dir no longer finds the project root`);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

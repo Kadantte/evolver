@@ -13,7 +13,6 @@ const { spawnSync } = require('child_process');
 // on large repos). See GHSA reports / issue #451.
 const MAX_EXEC_BUFFER = 10 * 1024 * 1024;
 
-const path = require('path');
 const { findEvolverRoot, findMemoryGraph } = require('./_runtimePaths');
 
 // Workspace-id must use the same resolution as the reader in

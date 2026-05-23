@@ -15,17 +15,21 @@ function freshRequire(id) {
 }
 
 describe('featureFlags persistence', function () {
+  // #114: redirect ~/.evomap by setting EVOLVER_HOME instead of monkey-patching
+  // `os.homedir`. The global monkey-patch was fragile (parallel-test hostile;
+  // affected any module that read homedir during the patch window).
   let tmpHome;
-  let originalHome;
+  let originalEvolverHome;
 
   beforeEach(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'evomap-flags-'));
-    originalHome = os.homedir;
-    os.homedir = () => tmpHome;
+    originalEvolverHome = process.env.EVOLVER_HOME;
+    process.env.EVOLVER_HOME = tmpHome;
   });
 
   afterEach(() => {
-    os.homedir = originalHome;
+    if (originalEvolverHome === undefined) delete process.env.EVOLVER_HOME;
+    else process.env.EVOLVER_HOME = originalEvolverHome;
     try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (_) {}
   });
 
@@ -57,18 +61,15 @@ describe('featureFlags persistence', function () {
 
 describe('isValidatorEnabled three-tier resolution', function () {
   let tmpHome;
-  let originalHome;
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
     tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'evomap-flags-'));
-    originalHome = os.homedir;
-    os.homedir = () => tmpHome;
+    process.env.EVOLVER_HOME = tmpHome;
     delete process.env.EVOLVER_VALIDATOR_ENABLED;
   });
 
   afterEach(() => {
-    os.homedir = originalHome;
     try { fs.rmSync(tmpHome, { recursive: true, force: true }); } catch (_) {}
     for (const k of Object.keys(process.env)) {
       if (!(k in originalEnv)) delete process.env[k];

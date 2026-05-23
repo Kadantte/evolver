@@ -1,7 +1,6 @@
 'use strict';
 
-const path = require('path');
-const os = require('os');
+const { getEvomapPath } = require('../gep/paths');
 const { MailboxStore } = require('./mailbox/store');
 const { ProxyHttpServer } = require('./server/http');
 const { buildRoutes } = require('./server/routes');
@@ -13,12 +12,13 @@ const { SkillUpdater } = require('./extensions/skillUpdater');
 const { DmHandler } = require('./extensions/dmHandler');
 const { SessionHandler } = require('./extensions/sessionHandler');
 
-const DEFAULT_DATA_DIR = path.join(os.homedir(), '.evomap', 'mailbox');
+// Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
+function _defaultDataDir() { return getEvomapPath('mailbox'); }
 
 class EvoMapProxy {
   constructor(opts = {}) {
     this.hubUrl = (opts.hubUrl || process.env.A2A_HUB_URL || '').replace(/\/+$/, '');
-    this.dataDir = opts.dataDir || opts.dbPath || DEFAULT_DATA_DIR;
+    this.dataDir = opts.dataDir || opts.dbPath || _defaultDataDir();
     this.port = opts.port;
     this.logger = opts.logger || console;
     this._skillPath = opts.skillPath || null;

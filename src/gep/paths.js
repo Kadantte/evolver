@@ -1,5 +1,6 @@
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 let _cachedRepoRoot = null;
 
@@ -42,33 +43,72 @@ function getRepoRoot() {
   const legacyFlag = process.env.EVOLVER_USE_PARENT_GIT;
   const legacyOptOut = typeof legacyFlag === 'string' && legacyFlag.toLowerCase() === 'false';
 
-  // Walk upward from process.cwd() — the project the user is standing in.
-  if (!noParent && !legacyOptOut) {
-    let cwd = process.cwd();
-    while (cwd !== path.dirname(cwd)) {
-      if (fs.existsSync(path.join(cwd, '.git'))) {
-        if (!process.env.EVOLVER_QUIET_PARENT_GIT) {
-          console.log('[evolver] Using host git repository at:', cwd);
-        }
-        _cachedRepoRoot = cwd;
-        return _cachedRepoRoot;
-      }
-      cwd = path.dirname(cwd);
-    }
+  // Both upward walks below must stop at the parent of the nearest
+  // `node_modules` ancestor — never escape into whatever `.git` happens
+  // to live above it (issue #541). On macOS with Homebrew, the global
+  // install lives at `/opt/homebrew/lib/node_modules/@evomap/evolver`
+  // and `/opt/homebrew` is itself a git repo; an unbounded walk
+  // therefore resolves repoRoot to `/opt/homebrew`, sending
+  // workspaceRoot / memoryDir / evolutionDir to a directory that
+  // doesn't belong to the user and silently producing evolution
+  // proposals for the wrong codebase.
+  //
+  // Boundary semantics: returns the parent of the nearest `node_modules`
+  // ancestor (inclusive — a `.git` at that parent IS still picked up),
+  // or null if `dir` is not inside any `node_modules` (dev clone /
+  // user project root). Callers stop AFTER checking the boundary path
+  // itself.
+  //
+  // For a local install (`<project>/node_modules/@evomap/evolver`), the
+  // parent of node_modules IS the user's project, so the boundary
+  // includes `<project>` and `<project>/.git` is still picked up
+  // correctly. For a dev clone, the boundary is null and the walk is
+  // unbounded as before.
+  function _nodeModulesBoundary(dir) {
+    const segments = dir.split(path.sep);
+    const nmIdx = segments.lastIndexOf('node_modules');
+    if (nmIdx <= 0) return null;
+    return segments.slice(0, nmIdx).join(path.sep) || path.sep;
   }
 
-  // Walk upward from ownDir's parent (local install inside node_modules).
-  if (!noParent && !legacyOptOut) {
-    let dir = path.dirname(ownDir);
+  function _walkForGit(start) {
+    const stopAt = _nodeModulesBoundary(start);
+    let dir = start;
     while (dir !== path.dirname(dir)) {
       if (fs.existsSync(path.join(dir, '.git'))) {
         if (!process.env.EVOLVER_QUIET_PARENT_GIT) {
           console.log('[evolver] Using host git repository at:', dir);
         }
-        _cachedRepoRoot = dir;
-        return _cachedRepoRoot;
+        return dir;
       }
+      if (stopAt !== null && dir === stopAt) break;
       dir = path.dirname(dir);
+    }
+    return null;
+  }
+
+  // Walk upward from process.cwd() — the project the user is standing in.
+  // Bounded the same way as the ownDir walk: a user who `cd`s into the
+  // global install (e.g. `cd /opt/homebrew/lib/node_modules/@evomap/evolver`
+  // to debug) would otherwise hit `/opt/homebrew/.git` here BEFORE the
+  // ownDir walk runs, defeating its boundary. The boundary still
+  // includes the parent of node_modules, so a user `cd`'d into
+  // `<their-project>/node_modules/lodash` still has `<their-project>/.git`
+  // picked correctly.
+  if (!noParent && !legacyOptOut) {
+    const hit = _walkForGit(process.cwd());
+    if (hit) {
+      _cachedRepoRoot = hit;
+      return _cachedRepoRoot;
+    }
+  }
+
+  // Walk upward from ownDir's parent (local install inside node_modules).
+  if (!noParent && !legacyOptOut) {
+    const hit = _walkForGit(path.dirname(ownDir));
+    if (hit) {
+      _cachedRepoRoot = hit;
+      return _cachedRepoRoot;
     }
   }
 
@@ -224,6 +264,27 @@ function getEvolverInstallRoot() {
   return path.resolve(__dirname, '..', '..');
 }
 
+// Resolve the per-user `~/.evomap` directory, with `EVOLVER_HOME` env var
+// override. Lazy (function call, not a module-level `const`) so tests can
+// flip `EVOLVER_HOME` per case without monkey-patching `os.homedir`.
+//
+// Existing call sites used to duplicate `path.join(os.homedir(), '.evomap')`
+// across ~9 modules; about two thirds silently ignored `EVOLVER_HOME` (it
+// worked for stake bootstrap and claim nudge but not for node-id, device-id,
+// feature flags, etc.). #114 consolidates onto this helper so the override
+// is uniform and tests don't need to monkey-patch the global homedir
+// function (which doesn't compose with `node --test` parallel execution).
+function getEvomapDir() {
+  return process.env.EVOLVER_HOME || path.join(os.homedir(), '.evomap');
+}
+
+// Join sub-segments under `~/.evomap`. Just a convenience wrapper so call
+// sites don't have to `path.join(getEvomapDir(), 'mailbox', 'state.json')`
+// in two pieces.
+function getEvomapPath(...segments) {
+  return path.join(getEvomapDir(), ...segments);
+}
+
 // Per-workspace random secret used to attest that a memory_graph.jsonl
 // entry was written by the same workspace that's now reading it. Stored
 // at <workspace>/.evolver/workspace-id with mode 0600 and lazily created
@@ -319,4 +380,6 @@ module.exports = {
   getNarrativePath,
   getEvolutionPrinciplesPath,
   getReflectionLogPath,
+  getEvomapDir,
+  getEvomapPath,
 };

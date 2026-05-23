@@ -14,10 +14,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 
-const FLAGS_DIR = path.join(os.homedir(), '.evomap');
-const FLAGS_FILE = path.join(FLAGS_DIR, 'feature_flags.json');
+// Lazy resolution via paths.getEvomapDir() — honors EVOLVER_HOME (#114).
+const { getEvomapDir } = require('./paths');
+function _flagsDir() { return getEvomapDir(); }
+function _flagsFile() { return path.join(_flagsDir(), 'feature_flags.json'); }
 const LOCAL_FLAGS_FILE = path.resolve(__dirname, '..', '..', '.evomap_feature_flags.json');
 
 let _cache = null;
@@ -37,16 +38,17 @@ function _readFile(p) {
 function _loadFromDisk() {
   if (_cacheLoaded) return _cache;
   _cacheLoaded = true;
-  _cache = _readFile(FLAGS_FILE) || _readFile(LOCAL_FLAGS_FILE) || {};
+  _cache = _readFile(_flagsFile()) || _readFile(LOCAL_FLAGS_FILE) || {};
   return _cache;
 }
 
 function _writeToDisk(obj) {
   try {
-    if (!fs.existsSync(FLAGS_DIR)) {
-      fs.mkdirSync(FLAGS_DIR, { recursive: true, mode: 0o700 });
+    const dir = _flagsDir();
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     }
-    fs.writeFileSync(FLAGS_FILE, JSON.stringify(obj, null, 2), { encoding: 'utf8', mode: 0o600 });
+    fs.writeFileSync(_flagsFile(), JSON.stringify(obj, null, 2), { encoding: 'utf8', mode: 0o600 });
     return true;
   } catch (_) {}
   try {
@@ -109,6 +111,7 @@ module.exports = {
   writeFeatureFlag,
   getAllFeatureFlags,
   _resetCacheForTests,
-  FLAGS_FILE,
+  // Getter so callers see the current EVOLVER_HOME at call time (#114).
+  get FLAGS_FILE() { return _flagsFile(); },
   LOCAL_FLAGS_FILE,
 };

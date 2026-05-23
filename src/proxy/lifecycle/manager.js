@@ -1,8 +1,15 @@
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
 const crypto = require('crypto');
 const { hubFetch } = require('../../gep/hubFetch');
+const { getEvomapPath } = require('../../gep/paths');
+
+// Hub's nodeId regex; mirror of src/gep/a2aProtocol.js so a malformed
+// legacy file can never feed garbage into the hello payload.
+const NODE_ID_RE = /^node_[a-f0-9]{12,32}$/;
 
 const DEFAULT_HEARTBEAT_INTERVAL = 360_000;
 const HELLO_TIMEOUT = 15_000;
@@ -28,6 +35,40 @@ function _getEnvFingerprint() {
     };
   }
   return _cachedFingerprint;
+}
+
+// Recover a node_id persisted by the legacy GEP path
+// (`src/gep/a2aProtocol.js` writes ~/.evomap/node_id, falling back to
+// `<install>/.evomap_node_id` when the home dir isn't writable). Without
+// this fallback, a daemon whose MailboxStore was created AFTER the legacy
+// GEP file (any install upgrading from pre-lifecycle to lifecycle, or any
+// state.json wiped without also wiping the legacy file) mints a fresh
+// `node_${randomBytes(6)}` identity in hello(), which the hub registers
+// as a *new* A2ANode under the same owner — the original (with stake,
+// reputation, aliases) gets silently abandoned. Mirror the writer's two
+// candidates in the same order as `_loadPersistedNodeId` so both code
+// paths land on the single identity.
+//
+// Resolve both paths on every call:
+//   - getEvomapPath() reads EVOLVER_HOME (and falls through to os.homedir())
+//     at call time, so tests and privileged-drop daemons can flip the
+//     resolved location without monkey-patching globals.
+//   - The install-root path uses __dirname so it's stable across cwd changes.
+function _readLegacyNodeId() {
+  const candidates = [
+    getEvomapPath('node_id'),
+    path.resolve(__dirname, '..', '..', '..', '.evomap_node_id'),
+  ];
+  for (const file of candidates) {
+    try {
+      if (!fs.existsSync(file)) continue;
+      const raw = fs.readFileSync(file, 'utf8').trim();
+      if (NODE_ID_RE.test(raw)) return raw;
+    } catch {
+      // Unreadable / racing writer — try the next location.
+    }
+  }
+  return null;
 }
 
 class AuthError extends Error {
@@ -156,7 +197,9 @@ class LifecycleManager {
     }
 
     const endpoint = `${this.hubUrl}/a2a/hello`;
-    const nodeId = this.store.getState('node_id') || `node_${crypto.randomBytes(6).toString('hex')}`;
+    const nodeId = this.store.getState('node_id')
+      || _readLegacyNodeId()
+      || `node_${crypto.randomBytes(6).toString('hex')}`;
 
     const payload = { capabilities: {} };
     if (rotateSecret) payload.rotate_secret = true;

@@ -2,12 +2,11 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
-const { getRepoRoot, getWorkspaceRoot, getMemoryDir, getEvolutionDir, getSkillsDir } = require('./paths');
+const { getRepoRoot, getWorkspaceRoot, getMemoryDir, getEvolutionDir, getSkillsDir, getEvomapDir } = require('./paths');
 
-const NODE_ID_DIR = path.join(os.homedir(), '.evomap');
-const NODE_ID_FILE = path.join(NODE_ID_DIR, 'node_id');
-const NODE_SECRET_FILE = path.join(NODE_ID_DIR, 'node_secret');
+// Lazy resolution via paths.getEvomapDir() — honors EVOLVER_HOME (#114).
+function _nodeIdFile() { return path.join(getEvomapDir(), 'node_id'); }
+function _nodeSecretFile() { return path.join(getEvomapDir(), 'node_secret'); }
 
 const A2A_ENV_KEYS = [
   'A2A_NODE_ID',
@@ -61,7 +60,7 @@ function _countDirs(dirPath) {
 function captureNodeIdentity() {
   const lines = [];
 
-  const nodeId = process.env.A2A_NODE_ID || _readFileSafe(NODE_ID_FILE);
+  const nodeId = process.env.A2A_NODE_ID || _readFileSafe(_nodeIdFile());
   if (nodeId) {
     lines.push('- Node ID: ' + nodeId + ' (REGISTERED -- do NOT re-register)');
   } else {
@@ -76,7 +75,7 @@ function captureNodeIdentity() {
     }
   }
 
-  const hasSecret = !!process.env.A2A_NODE_SECRET || _fileExists(NODE_SECRET_FILE);
+  const hasSecret = !!process.env.A2A_NODE_SECRET || _fileExists(_nodeSecretFile());
   if (hasSecret) {
     lines.push('- Node Secret: PRESENT (authenticated -- do NOT request new secret)');
   } else {
@@ -224,8 +223,8 @@ function captureLocalState() {
 
 function captureLocalStatePaths() {
   return {
-    nodeIdFile: NODE_ID_FILE,
-    nodeSecretFile: NODE_SECRET_FILE,
+    nodeIdFile: _nodeIdFile(),
+    nodeSecretFile: _nodeSecretFile(),
     envFile: path.join(getRepoRoot(), '.env'),
     memoryDir: getMemoryDir(),
     evolutionDir: getEvolutionDir(),

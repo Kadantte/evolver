@@ -13,17 +13,17 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const { getEvomapDir } = require('./paths');
 
 const CLAIM_NUDGE_COOLDOWN_MS = Math.max(
   60_000,
   Number(process.env.EVOLVER_CLAIM_NUDGE_COOLDOWN_MS) || 6 * 60 * 60 * 1000,
 );
 
-const STATE_FILE = path.join(
-  process.env.EVOLVER_HOME || path.join(os.homedir(), '.evomap'),
-  'claim_nudge_state.json',
-);
+// Evaluated lazily via a function so EVOLVER_HOME changes between calls
+// are honored (#114). Existing constants captured the env at module load,
+// which broke test isolation.
+function _stateFile() { return path.join(getEvomapDir(), 'claim_nudge_state.json'); }
 
 let _memory = { lastPrintedCode: null, lastPrintedAt: 0 };
 
@@ -33,7 +33,7 @@ function _ensureDir(file) {
 
 function _loadState() {
   try {
-    const raw = fs.readFileSync(STATE_FILE, 'utf8');
+    const raw = fs.readFileSync(_stateFile(), 'utf8');
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object') return parsed;
   } catch (_) {}
@@ -41,9 +41,9 @@ function _loadState() {
 }
 
 function _saveState(state) {
-  _ensureDir(STATE_FILE);
+  _ensureDir(_stateFile());
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state), 'utf8');
+    fs.writeFileSync(_stateFile(), JSON.stringify(state), 'utf8');
   } catch (_) {
     // best-effort
   }
@@ -110,12 +110,12 @@ function maybePrintClaimNudge(responsePayload, opts) {
 
 function _resetForTests() {
   _memory = { lastPrintedCode: null, lastPrintedAt: 0 };
-  try { fs.unlinkSync(STATE_FILE); } catch (_) {}
+  try { fs.unlinkSync(_stateFile()); } catch (_) {}
 }
 
 module.exports = {
   maybePrintClaimNudge,
   CLAIM_NUDGE_COOLDOWN_MS,
-  STATE_FILE,
+  get STATE_FILE() { return _stateFile(); },
   _resetForTests,
 };

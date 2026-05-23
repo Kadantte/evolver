@@ -7,8 +7,6 @@ const path = require('path');
 function freshRequire(modulePath) {
   const resolved = require.resolve(modulePath);
   delete require.cache[resolved];
-  // Also clear paths.js cache to pick up env overrides
-  try { delete require.cache[require.resolve('../src/gep/paths')]; } catch (_) {}
   return require(resolved);
 }
 

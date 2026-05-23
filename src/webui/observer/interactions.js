@@ -1,14 +1,15 @@
 'use strict';
 
 const http = require('http');
-const os = require('os');
 const path = require('path');
 const { getProxySettings } = require('./status');
 const { getProxyToken } = require('../../proxy/server/settings');
 const { readJsonl, paginate } = require('./jsonl');
 const { redactValue } = require('./redact');
+const { getEvomapPath } = require('../../gep/paths');
 
-const DEFAULT_MAILBOX_DIR = path.join(os.homedir(), '.evomap', 'mailbox');
+// Lazy via paths.getEvomapPath() — honors EVOLVER_HOME (#114).
+function _defaultMailboxDir() { return getEvomapPath('mailbox'); }
 
 async function getInteractions(query = {}) {
   const proxy = getProxySettings();
@@ -22,7 +23,7 @@ async function getInteractions(query = {}) {
 }
 
 function readMailboxMessages(query = {}) {
-  const mailboxDir = query.mailboxDir || process.env.EVOMAP_MAILBOX_DIR || DEFAULT_MAILBOX_DIR;
+  const mailboxDir = query.mailboxDir || process.env.EVOMAP_MAILBOX_DIR || _defaultMailboxDir();
   const messages = readJsonl(path.join(mailboxDir, 'messages.jsonl'), { last: query.last || 500 })
     .filter((row) => row && !row._op)
     .map((row) => normalizeMessage(redactValue(row)));
