@@ -178,6 +178,65 @@ function isPendingSolidify(state) {
   return String(lastSolid.run_id) !== String(lastRun.run_id);
 }
 
+/**
+ * Age (ms) of the currently-pending run, measured from last_run.created_at.
+ * Returns null when there is no pending run or no parseable timestamp — callers
+ * MUST treat null as "age unknown, do not force-reject" so a malformed/missing
+ * timestamp never causes us to discard a run that a sub-agent is still working.
+ * @param {object} state - parsed evolution_solidify_state.json
+ * @param {number} now - epoch ms (injected for deterministic tests)
+ * @returns {number|null}
+ */
+function pendingRunAgeMs(state, now) {
+  if (!isPendingSolidify(state)) return null;
+  const lastRun = state && state.last_run ? state.last_run : null;
+  const stamp = lastRun && (lastRun.created_at || lastRun.started_at);
+  if (!stamp) return null;
+  const t = Date.parse(String(stamp));
+  if (!Number.isFinite(t)) return null;
+  const age = Number(now) - t;
+  return age >= 0 ? age : null;
+}
+
+/**
+ * Issue #556: auto-reject a pending run that has been waiting longer than the
+ * staleness TTL. In Bridge mode the sub-agent solidifies asynchronously, so a
+ * pending run is normal *while the sub-agent is alive*. But if the sub-agent
+ * produced no changes, crashed, or the daemon restarted onto a stale pending
+ * state, last_solidify never catches up and the Ralph-loop gate sleeps forever.
+ * Once the pending run is older than the sub-agent's own hard ceiling
+ * (cycleTimeoutMs) it cannot still be running, so we clear it. This is distinct
+ * from rejectPendingRun()'s bridge-disabled reason so the two paths stay
+ * auditable in the state file.
+ * @returns {boolean} true if a stale pending run was found and rejected
+ */
+function rejectStalePendingRun(statePath) {
+  try {
+    const state = readJsonSafe(statePath);
+    // Re-check pending status under this fresh read (TOCTOU guard): if the
+    // sub-agent solidified between the gate's age snapshot and now, the run is
+    // no longer pending and we MUST NOT overwrite that successful solidify with
+    // a rejection. isPendingSolidify() is true only when last_run.run_id
+    // exists, so this also subsumes the run_id presence check.
+    if (state && isPendingSolidify(state)) {
+      state.last_solidify = {
+        run_id: state.last_run.run_id,
+        rejected: true,
+        reason: 'stale_pending_no_solidify_autoreject_no_rollback',
+        timestamp: new Date().toISOString(),
+      };
+      const tmp = `${statePath}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(state, null, 2) + '\n', 'utf8');
+      fs.renameSync(tmp, statePath);
+      return true;
+    }
+  } catch (e) {
+    console.warn('[Loop] Failed to clear stale pending run state: ' + (e.message || e));
+  }
+
+  return false;
+}
+
 function parseMs(v, fallback) {
   const n = parseInt(String(v == null ? '' : v), 10);
   if (Number.isFinite(n)) return Math.max(0, n);
@@ -1177,6 +1236,27 @@ async function main() {
         const cycleTimeoutMs = parseMs(process.env.EVOLVER_CYCLE_TIMEOUT_MS, 2700000); // 45 min default
         const progressUpdateMs = parseMs(process.env.EVOLVER_PROGRESS_UPDATE_MS, 60000); // 1 min default
 
+        // Issue #556: staleness TTL for a pending (un-solidified) run. In Bridge
+        // mode the gate below sleeps while a sub-agent solidifies asynchronously,
+        // which is correct *while the sub-agent is alive*. If the sub-agent made
+        // no changes / crashed / the daemon restarted onto a stale pending state,
+        // last_solidify never catches up and the gate would sleep forever. Once a
+        // pending run is older than the sub-agent's own hard ceiling it cannot
+        // still be running, so we auto-reject it and let the next cycle proceed.
+        //
+        // The default is the cycle hard-ceiling -- but ONLY when that ceiling is
+        // actually enforced. If EVOLVER_CYCLE_TIMEOUT_ENABLED=false (or the
+        // timeout is 0), a sub-agent may legitimately run longer than 45 min, so
+        // there is no safe default age at which a pending run is provably dead;
+        // we default the TTL to 0 (staleness auto-reject OFF) and let the user
+        // opt back in explicitly via EVOLVER_PENDING_STALE_MS. A value of 0
+        // disables the TTL check in the gate below.
+        const cycleCeilingMs = cycleTimeoutEnabled ? cycleTimeoutMs : 0;
+        const pendingStaleMs = parseMs(
+          process.env.EVOLVER_PENDING_STALE_MS,
+          cycleCeilingMs
+        );
+
         // Start hub heartbeat (keeps node alive independently of evolution cycles)
         try {
           if (process.env.EVOMAP_PROXY === '1' || process.env.A2A_TRANSPORT === 'mailbox') {
@@ -1344,8 +1424,30 @@ async function main() {
           // Ralph-loop gating: do not run a new cycle while previous run is pending solidify.
           const st0 = readJsonSafe(solidifyStatePath);
           if (isPendingSolidify(st0)) {
-            await sleepMs(Math.max(pendingSleepMs, minSleepMs));
-            continue;
+            // Issue #556: a pending run that has outlived the sub-agent's hard
+            // ceiling can never be solidified by that sub-agent, so clear it
+            // instead of sleeping forever. This applies in Bridge mode too,
+            // where the bridge-disabled auto-reject below never runs. TTL-gated
+            // so a live sub-agent's in-flight pending state is left untouched.
+            const ageMs = pendingRunAgeMs(st0, Date.now());
+            const cleared =
+              pendingStaleMs > 0 && ageMs !== null && ageMs >= pendingStaleMs
+                ? rejectStalePendingRun(solidifyStatePath)
+                : false;
+            if (cleared) {
+              console.warn(
+                '[Loop] Auto-rejected stale pending run after ' +
+                  Math.round(ageMs / 1000) + 's with no solidify ' +
+                  '(sub-agent did not complete; state only, no rollback). Issue #556.'
+              );
+              // Run was cleared (no longer pending) -> fall through to a fresh cycle.
+            } else {
+              // Either not stale yet, or the reject did not take (write failed /
+              // solidify won the race). In every such case the run is still
+              // pending, so sleep instead of stacking a new cycle on top of it.
+              await sleepMs(Math.max(pendingSleepMs, minSleepMs));
+              continue;
+            }
           }
 
           const t0 = Date.now();
@@ -2759,7 +2861,9 @@ module.exports = {
   main,
   readJsonSafe,
   rejectPendingRun,
+  rejectStalePendingRun,
   isPendingSolidify,
+  pendingRunAgeMs,
   parseBoolEnv,
   CycleTimeoutError,
   writeCycleProgressAtomic,
