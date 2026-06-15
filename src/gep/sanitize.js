@@ -170,6 +170,11 @@ const ENV_SCAN_SKIP_KEYS = new Set([
   'PAGER', 'LESS', 'LS_COLORS', 'COLORTERM', 'TERM_PROGRAM',
   'XDG_SESSION_ID', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS',
   'SSH_AUTH_SOCK', 'SSH_AGENT_PID', '_',
+  // Public CI identity — GitHub Actions sets these to usernames / org names,
+  // never secrets. Without skipping them, detectEnvValueLeaks flags any content
+  // that merely contains the actor's username (e.g. a commit-author noreply
+  // email) as an env-value leak: a false positive that fails only under CI.
+  'GITHUB_ACTOR', 'GITHUB_TRIGGERING_ACTOR', 'GITHUB_REPOSITORY_OWNER',
 ]);
 
 /**
@@ -213,6 +218,15 @@ function detectEnvValueLeaks(content) {
   for (const [key, val] of Object.entries(process.env)) {
     if (!val || val.length < 8) continue;
     if (ENV_SCAN_SKIP_KEYS.has(key)) continue;
+    // Filesystem paths and URLs are not secrets, and CI tooling exports dozens
+    // of env vars whose value is the repo checkout path — the runner
+    // (GITHUB_WORKSPACE, RUNNER_WORKSPACE) and, when tests run via `npm test`,
+    // npm itself (INIT_CWD, npm_config_local_prefix, npm_package_json, PWD).
+    // Reverse-flagging them is a false positive whenever capsule content
+    // legitimately references the build path: it blocks self-PRs and fails only
+    // under CI. Genuine sensitive paths in content are still caught by the
+    // local_path pattern scanner, and credentialed URLs by db_url / basic_auth.
+    if (/^(\/|[A-Za-z]:\\|[a-z][a-z0-9+.-]*:\/\/)/i.test(val)) continue;
     if (content.includes(val)) {
       leaks.push({ type: 'env_value_leak', envKey: key, value: val.length > 60 ? val.slice(0, 57) + '...' : val, suggestion: 'process.env.' + key });
     }

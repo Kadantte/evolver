@@ -1,4 +1,65 @@
 #!/usr/bin/env node
+function _printProxyTokenUsage(out = process.stderr) {
+  out.write('Usage: node index.js proxy-token [--settings FILE]\n');
+}
+
+function _readProxyTokenFromSettingsFile(fs, settingsFile) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+    return parsed && parsed.proxy && typeof parsed.proxy.token === 'string'
+      ? parsed.proxy.token
+      : '';
+  } catch {
+    return '';
+  }
+}
+
+// `proxy-token` is a credential helper for Codex. Handle it before loading any
+// project .env so a workspace cannot change EVOLVER_SETTINGS_DIR or other local
+// state used to find the proxy token.
+if (process.argv[2] === 'proxy-token') {
+  try {
+    const _fs = require('fs');
+    const _os = require('os');
+    const _path = require('path');
+    let settingsFile = '';
+    for (let i = 3; i < process.argv.length; i++) {
+      const arg = process.argv[i];
+      if (arg === '-h' || arg === '--help') {
+        _printProxyTokenUsage(process.stdout);
+        process.exit(0);
+      }
+      if (arg === '--settings') {
+        if (!process.argv[i + 1]) {
+          _printProxyTokenUsage();
+          console.error('[proxy-token] missing value for --settings');
+          process.exit(2);
+        }
+        settingsFile = process.argv[i + 1];
+        i++;
+        continue;
+      }
+      _printProxyTokenUsage();
+      console.error('[proxy-token] unknown argument');
+      process.exit(2);
+    }
+    const defaultSettingsFile = _path.join(
+      process.env.EVOLVER_SETTINGS_DIR || _path.join(_os.homedir(), '.evolver'),
+      'settings.json',
+    );
+    const token = _readProxyTokenFromSettingsFile(_fs, settingsFile || defaultSettingsFile);
+    if (!token) {
+      console.error('[proxy-token] no active proxy token found; start evolver with EVOMAP_PROXY=1 first');
+      process.exit(1);
+    }
+    process.stdout.write(token + '\n');
+    process.exit(0);
+  } catch (e) {
+    console.error('[proxy-token] Failed:', e && e.message || e);
+    process.exit(1);
+  }
+}
+
 // Load .env BEFORE any internal require so that a2aProtocol and ATP
 // modules see A2A_NODE_SECRET / A2A_NODE_ID / A2A_HUB_URL at first
 // access and never fall back to a stale persisted/cached secret.
@@ -268,23 +329,17 @@ function getLastSignals(statePath) {
 
 // Singleton Guard - prevent multiple evolver daemon instances.
 //
-// Round-4: pidfile location previously defaulted to __dirname, which is a
-// DIFFERENT path per install mode -- /usr/local/lib/node_modules/... for a
-// global install, the dev-clone path for `node index.js`, a transient
-// $NPM_CACHE/_npx/<hash> for `npx evolver`. Two daemons launched under
-// different install modes never saw each other's lock and could run
-// concurrently against the same ~/.evomap/node_secret, ping-ponging on
-// secret rotation and silently entering reauth backoff -- the user-
-// reported "first launch ok, idle, then dead forever" pattern. Default
-// now lives under the per-user state dir so all install modes converge.
-// EVOLVER_LOCK_DIR still overrides for tests / sandboxed runs.
-function getLockFilePath() {
-  if (process.env.EVOLVER_LOCK_DIR) {
-    return path.join(process.env.EVOLVER_LOCK_DIR, 'evolver.pid');
-  }
-  // os.homedir() is cross-platform; process.env.HOME is unset on Windows.
-  return path.join(os.homedir(), '.evomap', 'instance.lock');
-}
+// Lock location + lease tunables live in src/adapters/scripts/_lockPaths.js
+// (issue #176): the session-start hook's auto-restart guard needs the exact
+// same resolution, and inlining it in both places drifted. The Round-4
+// (per-install-mode pidfile convergence) and Round-9 (lease staleness)
+// history notes moved there with the code.
+const {
+  getLockFilePath,
+  lockIsStaleByLease: _lockIsStaleByLease,
+  STALE_LOCK_TTL_MS,
+  LOCK_REFRESH_MS,
+} = require('./src/adapters/scripts/_lockPaths');
 
 function _writeLockAtomic(lockFile, payload) {
   // Round-6 (§19.8): the previous implementation used tmp + rename, which
@@ -372,37 +427,10 @@ function _lockPayload() {
   });
 }
 
-// Round-9: lease tunables for the daemon lock. A live daemon refreshes the
-// lock mtime every LOCK_REFRESH_MS; a lock whose mtime is older than
-// STALE_LOCK_TTL_MS (and that was written by a lease-aware daemon) is
-// treated as stale even if its PID happens to be alive -- closing the
-// "crash + PID reuse -> new daemon silently refuses to start" hole and the
-// "SIGKILL leaves a stale lock nobody reclaims" hole. The TTL is well above
-// the heartbeat interval (default 6min) so a healthy daemon never trips it.
-// On Windows, SIGTERM is implemented as TerminateProcess() (not a catchable
-// signal), so the shutdown() handler that calls releaseLock() never runs.
-// The lock file stays on disk with the dead PID. Reduce the TTL on Windows
-// so a subsequent start doesn't wait 15 minutes to reclaim the stale lock.
-// Unix dropped from 15 min -> 5 min so a wedged daemon does not block takeover
-// for a quarter hour. 5 min is still 2.5x the 2-min Unix refresh cadence.
-// Windows 3 min TTL gets a 1-min refresh (3x margin) since 2-min refresh left
-// only 1.5x margin against transient FS hiccups.
-const STALE_LOCK_TTL_MS = process.platform === 'win32' ? 3 * 60_000 : 5 * 60_000;
-const LOCK_REFRESH_MS = process.platform === 'win32' ? 1 * 60_000 : 2 * 60_000;
+// STALE_LOCK_TTL_MS / LOCK_REFRESH_MS / _lockIsStaleByLease come from
+// src/adapters/scripts/_lockPaths.js (required next to getLockFilePath
+// above) — see issue #176 and the Round-9 history note in that module.
 let _lockRefreshTimer = null;
-
-// Returns true if the lock was written by a lease-aware daemon AND its
-// mtime is older than the stale TTL -- i.e. no live owner is refreshing it,
-// so it is safe to reclaim regardless of whether the recorded PID resolves.
-function _lockIsStaleByLease(lockFile, payload) {
-  if (!payload || payload.lease !== true) return false;
-  try {
-    const ageMs = Date.now() - fs.statSync(lockFile).mtimeMs;
-    return ageMs > STALE_LOCK_TTL_MS;
-  } catch (_) {
-    return false;
-  }
-}
 
 // Start refreshing the lock file's mtime so other processes can tell this
 // daemon is alive without trusting a (recyclable) PID. unref'd: it never
@@ -658,7 +686,7 @@ async function main() {
     // failure mode obvious.
     try {
       const { execSync } = require('child_process');
-      execSync('git --version', { stdio: 'ignore', timeout: 5000 });
+      execSync('git --version', { stdio: 'ignore', timeout: 5000, windowsHide: true });
     } catch (_gitErr) {
       console.error('');
       console.error('[Preflight] Could not run "git --version". Evolver requires git to be installed and available on PATH.');
@@ -1185,9 +1213,38 @@ async function main() {
               hubUrl: process.env.A2A_HUB_URL,
             });
             console.log('[Proxy] Started on ' + proxyInfo.url);
+            try {
+              const { injectProxyEnv } = require('./src/proxy/inject');
+              const injected = injectProxyEnv(proxyInfo);
+              if (injected.injected) {
+                console.log('[Proxy] Auto-injected client env for Claude Code/Codex/Cursor. Set EVOMAP_PROXY_AUTO_INJECT=off to disable.');
+              } else {
+                console.log('[Proxy] Auto-inject skipped: ' + injected.reason);
+              }
+            } catch (injectErr) {
+              console.warn('[Proxy] Auto-inject failed: ' + (injectErr && injectErr.message || injectErr));
+            }
             const { registerMailboxTransport } = require('./src/gep/mailboxTransport');
             registerMailboxTransport();
             process.env.A2A_TRANSPORT = 'mailbox';
+            try {
+              const a2a = require('./src/gep/a2aProtocol');
+              a2a.startSystemdNotifyWatchdog(function () {
+                try {
+                  const proxy = proxyInfo && proxyInfo.proxy;
+                  const lifecycle = proxy && proxy.lifecycle;
+                  if (lifecycle && typeof lifecycle.getHeartbeatStats === 'function') {
+                    const stats = lifecycle.getHeartbeatStats();
+                    // Hub-backed lifecycle stats are authoritative even when stopped;
+                    // systemd should starve and restart instead of seeing a false ping.
+                    if (stats && (stats.running || proxy.hubUrl)) return stats;
+                  }
+                } catch (_) {}
+                return { running: true, consecutiveFailures: 0, lastTickAt: Date.now() };
+              });
+            } catch (sdErr) {
+              console.warn('[Heartbeat] systemd notify/watchdog setup failed: ' + (sdErr && sdErr.message || sdErr));
+            }
           } else {
             const a2a = require('./src/gep/a2aProtocol');
             try { a2a.startHeartbeat(); }
@@ -1219,6 +1276,19 @@ async function main() {
           }
         } catch (vdErr) {
           console.warn('[ValidatorDaemon] failed to start: ' + (vdErr && vdErr.message || vdErr));
+        }
+
+        // OAuth token auto-refresh: if a device-flow OAuth token is present,
+        // keep it fresh in the background so long-running `evolver run` loops
+        // never hit an expired a2a token mid-request. No-op for node_secret nodes.
+        try {
+          const { loadOAuthToken, startTokenAutoRefresh } = require('./src/gep/oauthLogin');
+          if (loadOAuthToken()) {
+            startTokenAutoRefresh();
+            console.log('[OAuth] token auto-refresh scheduled.');
+          }
+        } catch (oauthRefreshErr) {
+          console.warn('[OAuth] auto-refresh setup failed: ' + (oauthRefreshErr && oauthRefreshErr.message || oauthRefreshErr));
         }
 
         // ATP: auto-start merchant agent if enabled
@@ -1834,9 +1904,9 @@ async function main() {
     const repoRoot = getRepoRoot();
     let diff = '';
     try {
-      const unstaged = execSync('git diff', { cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER }).trim();
-      const staged = execSync('git diff --cached', { cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER }).trim();
-      const untracked = execSync('git ls-files --others --exclude-standard', { cwd: repoRoot, encoding: 'utf8', timeout: 10000, maxBuffer: MAX_EXEC_BUFFER }).trim();
+      const unstaged = execSync('git diff', { cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER, windowsHide: true }).trim();
+      const staged = execSync('git diff --cached', { cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER, windowsHide: true }).trim();
+      const untracked = execSync('git ls-files --others --exclude-standard', { cwd: repoRoot, encoding: 'utf8', timeout: 10000, maxBuffer: MAX_EXEC_BUFFER, windowsHide: true }).trim();
       if (staged) diff += '=== Staged Changes ===\n' + staged + '\n\n';
       if (unstaged) diff += '=== Unstaged Changes ===\n' + unstaged + '\n\n';
       if (untracked) diff += '=== Untracked Files ===\n' + untracked + '\n';
@@ -1918,13 +1988,13 @@ async function main() {
     } else if (args.includes('--reject')) {
       console.log('\n[Review] Rejected. Rolling back changes...');
       try {
-        execSync('git checkout -- .', { cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER });
+        execSync('git checkout -- .', { cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER, windowsHide: true });
         // Preserve user state on reject: .env files, node_modules, runtime
         // PID files, and a dedicated workspace/ dir (if one exists) MUST NOT
         // be wiped by an automated rollback. Users have reported losing
         // secrets and runtime caches to an aggressive git clean.
         execSync('git clean -fd -e node_modules -e workspace -e .env -e ".env.*" -e "*.pid"', {
-          cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER,
+          cwd: repoRoot, encoding: 'utf8', timeout: 30000, maxBuffer: MAX_EXEC_BUFFER, windowsHide: true,
         });
         const evolDir = getEvolutionDir();
         const sp = path.join(evolDir, 'evolution_solidify_state.json');
@@ -1972,6 +2042,7 @@ async function main() {
     }
 
     const { getHubUrl, getNodeId, buildHubHeaders, sendHelloToHub, getHubNodeSecret } = require('./src/gep/a2aProtocol');
+    const { hubFetch } = require('./src/gep/hubFetch');
 
     const hubUrl = getHubUrl();
     if (!hubUrl) {
@@ -2001,7 +2072,7 @@ async function main() {
 
       console.log('[fetch] Downloading skill: ' + skillId);
 
-      const resp = await fetch(endpoint, {
+      const resp = await hubFetch(endpoint, {
         method: 'POST',
         headers: buildHubHeaders(),
         body: JSON.stringify({ sender_id: nodeId }),
@@ -2035,7 +2106,7 @@ async function main() {
         } else if (resp.status >= 500) {
           console.error('  Server error. The Hub may be temporarily unavailable.');
           console.error('  Try again in a few minutes. If the issue persists, report at:');
-          console.error('    https://github.com/autogame-17/evolver/issues');
+          console.error('    https://github.com/EvoMap/evolver/issues');
         }
         if (isVerbose) {
           console.error('[Verbose] Endpoint: ' + endpoint);
@@ -2183,6 +2254,7 @@ async function main() {
 
   } else if (command === 'sync') {
     const { getHubUrl, getNodeId, buildHubHeaders, sendHelloToHub, getHubNodeSecret } = require('./src/gep/a2aProtocol');
+    const { hubFetch } = require('./src/gep/hubFetch');
     const { upsertGene, upsertCapsule, loadGenes, loadCapsules } = require('./src/gep/assetStore');
     const { getGepAssetsDir, getMemoryDir } = require('./src/gep/paths');
 
@@ -2251,7 +2323,7 @@ async function main() {
               if (v != null) url += '&' + k + '=' + encodeURIComponent(v);
             }
           }
-          const resp = await fetch(url, {
+          const resp = await hubFetch(url, {
             method: 'GET',
             headers: buildHubHeaders(),
             signal: AbortSignal.timeout(30000),
@@ -2368,7 +2440,7 @@ async function main() {
         try {
           let payload = asset.payload;
           if (!payload) {
-            const detailResp = await fetch(baseUrl + '/a2a/assets/' + encodeURIComponent(assetId) + '?detailed=true', {
+            const detailResp = await hubFetch(baseUrl + '/a2a/assets/' + encodeURIComponent(assetId) + '?detailed=true', {
               method: 'GET',
               headers: buildHubHeaders(),
               signal: AbortSignal.timeout(15000),
@@ -2548,6 +2620,33 @@ async function main() {
       console.error('[webui] Failed: ' + (error && error.message || error));
       process.exit(1);
     }
+
+  } else if (command === 'login') {
+    const { deviceLogin, resolveHubUrl, tokenFile } = require('./src/gep/oauthLogin');
+    const hubUrl = resolveHubUrl();
+    try {
+      console.log('Logging in to ' + hubUrl + ' ...');
+      const tok = await deviceLogin({
+        hubUrl,
+        onCode: ({ userCode, verificationUri }) => {
+          console.log('\nTo authorize this device:');
+          console.log('  1. open  ' + verificationUri);
+          console.log('  2. enter code:  ' + userCode);
+          console.log('\nWaiting for approval (Ctrl-C to cancel)...');
+        },
+      });
+      console.log('\n✓ Logged in. Token stored at ' + tokenFile() + ' (expires ' + new Date(tok.expires_at).toISOString() + ').');
+      process.exit(0);
+    } catch (error) {
+      console.error('login failed: ' + (error && error.message || error));
+      process.exit(1);
+    }
+
+  } else if (command === 'logout') {
+    const { clearOAuthToken, tokenFile } = require('./src/gep/oauthLogin');
+    const removed = clearOAuthToken();
+    console.log(removed ? ('Logged out (removed ' + tokenFile() + ').') : 'No OAuth token to remove.');
+    process.exit(0);
 
   } else if (command === 'setup-hooks') {
     const hookAdapter = require('./src/adapters/hookAdapter');
@@ -2904,8 +3003,40 @@ async function main() {
       process.exit(1);
     }
 
+  } else if (command === 'experiment') {
+    // Comparative experiment runner: run the SAME task twice -- a baseline arm
+    // and a variant arm that reuses a gene's strategy -- via a headless agent
+    // CLI, collect duration/rounds/tokens/pass-rate, and print a comparison
+    // JSON to stdout. Consumed by EvoMap Desktop's ExperimentsAPI.Run, which
+    // spawns `node index.js experiment --request-file=<json>` and parses stdout.
+    try {
+      const expCli = require('./src/experiment/cli');
+      const parsed = expCli.parseExperimentArgs(args.slice(1));
+      if (!parsed.ok) {
+        console.error('[Experiment] ' + parsed.error);
+        console.error(expCli.printExperimentUsage());
+        process.exit(2);
+      }
+      const res = await expCli.runExperiment(parsed.opts, { err: (...a) => console.error(...a) });
+      // stdout carries ONLY the structured JSON so the Go caller can JSON.parse
+      // it without log contamination; all logging above went to stderr. res.data
+      // is already secret-redacted by runExperiment (sanitizePayload).
+      if (res && res.data) process.stdout.write(JSON.stringify(res.data) + '\n');
+      process.exit(res && typeof res.exitCode === 'number' ? res.exitCode : (res && res.ok ? 0 : 1));
+    } catch (expErr) {
+      console.error('[Experiment] CLI error:', expErr && expErr.message || expErr);
+      process.exit(1);
+    }
+
   } else {
-    console.log(`Usage: node index.js [run|/evolve|solidify|review|distill|fetch|sync|asset-log|webui|setup-hooks|recipe|buy|orders|verify|atp|atp-complete] [--loop]
+    console.log(`Usage: node index.js [run|/evolve|login|logout|proxy-token|solidify|review|distill|fetch|sync|asset-log|webui|setup-hooks|recipe|buy|orders|verify|atp|atp-complete|experiment] [--loop]
+  - login                      (authorize this device via the hub, gh-auth-login style; stores an OAuth token used instead of node_secret)
+  - logout                     (remove the stored OAuth token)
+  - proxy-token                (print the local proxy bearer token for command-backed client auth)
+  - experiment flags:
+    - --task="..." --metric="..."              (required; same task, baseline vs variant)
+    - --gene=<geneId>                          (variant arm reuses this gene's strategy)
+    - --baseline="..." --variant="..." --validation="c1;;c2" --request-file=<json>
   - recipe flags:
     - build --title="..." --genes=<asset_id,...> [--description] [--price=N] [--publish]
                               (builds a DRAFT DNA blueprint; --publish is opt-in)

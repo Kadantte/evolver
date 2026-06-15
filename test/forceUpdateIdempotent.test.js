@@ -96,6 +96,161 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
     assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called');
   });
 
+  it('newer current version: returns FORCE_UPDATE_NOOP and does not downgrade', () => {
+    writeInstallPkg('1.88.4');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('degit must not be invoked when current version is newer than required');
+    };
+    const { executeForceUpdate, FORCE_UPDATE_NOOP } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.3' });
+
+    assert.equal(result, FORCE_UPDATE_NOOP, 'newer current version satisfies the force-update floor');
+    assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called, avoiding downgrade');
+  });
+
+  it('newer current version with bare stale required version: returns FORCE_UPDATE_NOOP', () => {
+    writeInstallPkg('1.88.4');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('degit must not be invoked when current version is newer than bare required');
+    };
+    const { executeForceUpdate, FORCE_UPDATE_NOOP } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '1.88.3' });
+
+    assert.equal(result, FORCE_UPDATE_NOOP, 'bare stale required_version is also a minimum floor');
+    assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called, avoiding downgrade');
+  });
+
+  it('newer current version with leading v: normalizes and does not downgrade', () => {
+    writeInstallPkg('v1.88.4');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('degit must not be invoked when normalized current is newer than required');
+    };
+    const { executeForceUpdate, FORCE_UPDATE_NOOP } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.3' });
+
+    assert.equal(result, FORCE_UPDATE_NOOP, 'leading-v current version satisfies the force-update floor');
+    assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called, avoiding downgrade');
+  });
+
+  it('required version with leading v: normalizes and still upgrades older installs', () => {
+    writeInstallPkg('1.88.2');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('simulated degit failure');
+    };
+    const { executeForceUpdate } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=v1.88.3' });
+
+    assert.equal(result.ok, false, 'older current version must not skip a leading-v required floor');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
+    assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
+  });
+
+  it('newer prerelease with hyphen identifier: returns FORCE_UPDATE_NOOP and does not downgrade', () => {
+    writeInstallPkg('1.88.4-alpha-1');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('degit must not be invoked when hyphenated prerelease current is newer');
+    };
+    const { executeForceUpdate, FORCE_UPDATE_NOOP } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.3' });
+
+    assert.equal(result, FORCE_UPDATE_NOOP, 'newer hyphenated prerelease satisfies the force-update floor');
+    assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called, avoiding downgrade');
+  });
+
+  it('newer prerelease current version: compares numeric prerelease identifiers', () => {
+    writeInstallPkg('1.88.0-rc.10');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('degit must not be invoked when prerelease current is newer than required');
+    };
+    const { executeForceUpdate, FORCE_UPDATE_NOOP } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.0-rc.2' });
+
+    assert.equal(result, FORCE_UPDATE_NOOP, 'rc.10 satisfies an rc.2 force-update floor');
+    assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called');
+  });
+
+  it('older prerelease current version: compares oversized numeric identifiers without Number precision loss', () => {
+    writeInstallPkg('1.0.0-9007199254740992');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('simulated degit failure');
+    };
+    const { executeForceUpdate } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.0.0-9007199254740993' });
+
+    assert.equal(result.ok, false, 'older oversized prerelease must fall through to the upgrade path');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
+    assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
+  });
+
+  it('older current version: compares oversized major/minor/patch without Number precision loss', () => {
+    const cases = [
+      [
+        '9007199254740992.9007199254740992.9007199254740992',
+        '>=9007199254740993.9007199254740992.9007199254740992',
+      ],
+      [
+        '9007199254740992.9007199254740992.9007199254740992',
+        '>=9007199254740992.9007199254740993.9007199254740992',
+      ],
+      [
+        '9007199254740992.9007199254740992.9007199254740992',
+        '>=9007199254740992.9007199254740992.9007199254740993',
+      ],
+    ];
+
+    for (const [currentVersion, requiredVersion] of cases) {
+      writeInstallPkg(currentVersion);
+      let execFileCalls = 0;
+      const stub = function () {
+        execFileCalls++;
+        throw new Error('simulated degit failure');
+      };
+      const { executeForceUpdate } = freshRequireForceUpdate(stub);
+
+      const result = executeForceUpdate({ required_version: requiredVersion });
+
+      assert.equal(result.ok, false, 'older oversized core semver must fall through to the upgrade path');
+      assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
+      assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
+    }
+  });
+
+  it('stable current version satisfies a prerelease floor', () => {
+    writeInstallPkg('1.88.0');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('degit must not be invoked when stable current satisfies prerelease floor');
+    };
+    const { executeForceUpdate, FORCE_UPDATE_NOOP } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.0-rc.5' });
+
+    assert.equal(result, FORCE_UPDATE_NOOP, 'stable release is newer than its prerelease');
+    assert.equal(execFileCalls, 0, 'degit (execFileSync) must NOT be called');
+  });
+
   it('version mismatch: falls through to normal upgrade path', () => {
     writeInstallPkg('1.87.5');
     let execFileCalls = 0;
@@ -112,8 +267,42 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: '1.88.0' });
 
-    assert.equal(result, false, 'no short-circuit; degit failure -> false');
+    assert.equal(result.ok, false, 'no short-circuit; degit failure -> structured failure');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
     assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
+  });
+
+  it('prerelease below stable floor: falls through to normal upgrade path', () => {
+    writeInstallPkg('1.88.0-rc.5');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('simulated degit failure');
+    };
+    const { executeForceUpdate } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.0' });
+
+    assert.equal(result.ok, false, 'prerelease must not satisfy stable force-update floor');
+    assert.equal(result.code, 'degit_failed', 'degit throw classified as degit_failed');
+    assert.equal(execFileCalls, 1, 'Channel 1 (degit) was attempted exactly once');
+  });
+
+  it('malformed current version: does not satisfy a lower-looking force-update floor', () => {
+    writeInstallPkg('1.88.04');
+    let execFileCalls = 0;
+    const stub = function () {
+      execFileCalls++;
+      throw new Error('simulated degit failure');
+    };
+    const { executeForceUpdate } = freshRequireForceUpdate(stub);
+
+    const result = executeForceUpdate({ required_version: '>=1.88.3' });
+
+    assert.equal(result.ok, false, 'invalid current version must fail closed');
+    assert.equal(result.code, 'current_version_unparsable',
+      'unparseable installed version → current_version_unparsable (the new #213 anti-downgrade guard branch)');
+    assert.equal(execFileCalls, 0, 'Channel 1 (degit) must NOT be attempted with invalid current version');
   });
 
   it('garbage required_version: parse failure, no short-circuit, returns false', () => {
@@ -129,7 +318,8 @@ describe('executeForceUpdate: idempotency short-circuit', () => {
 
     const result = executeForceUpdate({ required_version: 'garbage' });
 
-    assert.equal(result, false, 'parse failure must return false');
+    assert.equal(result.ok, false, 'parse failure must return a structured failure');
+    assert.equal(result.code, 'bad_required_version', 'garbage required_version → bad_required_version');
     assert.equal(execFileCalls, 0, 'execFileSync never reached (rejected before Channel 1)');
   });
 });

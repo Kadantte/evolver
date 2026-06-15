@@ -810,7 +810,60 @@ describe('force_update last_update reporting', () => {
     var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
     assert.equal(payload.status, 'failed');
     assert.equal(payload.to_version, '1.88.0');
-    assert.equal(payload.error, 'boom');
+    // A THROWN error (no structured failure) is prefixed with the
+    // `unexpected_error` code so every failed row carries a "code: detail"
+    // shape for GROUP BY split_part(error, ':', 1). executeForceUpdate now
+    // catches its own Channel 1 errors and RETURNS structured failures, so
+    // this thrown path is the rare "threw outside the inner try" case.
+    assert.equal(payload.error, 'unexpected_error: boom');
+  });
+
+  it('(u2) structured failure encodes as "code: detail" (the headline feature)', () => {
+    assert.ok(!fs.existsSync(_statePath()));
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      { updated: false, failure: { ok: false, code: 'degit_failed', detail: 'spawn npx ENOENT' } }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.equal(payload.status, 'failed');
+    // This is the whole point: the hub can now `GROUP BY split_part(error, ':', 1)`
+    // instead of seeing N rows of the identical "executeForceUpdate returned false".
+    assert.equal(payload.error, 'degit_failed: spawn npx ENOENT');
+  });
+
+  it('(u3) structured failure with empty detail persists the bare code', () => {
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      { updated: false, failure: { ok: false, code: 'all_channels_exhausted', detail: '' } }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.equal(payload.error, 'all_channels_exhausted');
+  });
+
+  it('(u4) structured failure (returned) wins over a thrown error when both are present', () => {
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      {
+        updated: false,
+        failure: { ok: false, code: 'copy_failed', detail: 'index.js: EPERM' },
+        error: new Error('boom'),
+      }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.equal(payload.error, 'copy_failed: index.js: EPERM',
+      'the precise returned-failure code beats the generic thrown error; legacy fallback never appears');
+  });
+
+  it('(u5) structured failure detail is redacted before persisting (degit stderr can carry tokens)', () => {
+    var token = 'npm_' + 'c'.repeat(36);
+    reportForceUpdateOutcome(
+      { required_version: '>=1.88.3' },
+      { updated: false, failure: { ok: false, code: 'degit_failed', detail: 'registry 401 token=' + token } }
+    );
+    var payload = JSON.parse(fs.readFileSync(_statePath(), 'utf8'));
+    assert.ok(payload.error.startsWith('degit_failed: '), 'code prefix preserved for GROUP BY');
+    assert.ok(!payload.error.includes(token), 'a token in the detail must be redacted');
+    assert.ok(/\[REDACTED\]/.test(payload.error), 'redaction marker present');
   });
 
   it('(v) reportForceUpdateOutcome public API: unparsable required_version writes nothing', async () => {
@@ -1204,8 +1257,10 @@ describe('force_update last_update reporting', () => {
     assert.ok(/\[REDACTED\]/.test(payload.error),
       'at least one redaction marker must be present');
     // The non-sensitive prefix must survive so operators still see what failed.
-    assert.ok(payload.error.startsWith('npm install failed'),
-      'redactor preserves the message structure / leading context');
+    // (A thrown error is now code-prefixed with `unexpected_error: ` — the
+    // original message still leads the rest of the string.)
+    assert.ok(payload.error.startsWith('unexpected_error: npm install failed'),
+      'redactor preserves the message structure / leading context after the code prefix');
   });
 
   // (ll) Companion to (kk): redact runs BEFORE the ERROR_MAX truncation,
@@ -1313,7 +1368,8 @@ describe('force_update last_update reporting', () => {
   });
 
   // (nn) Bugbot PR#188 #2: _extractTargetVersion must reject trailing
-  // whitespace, mirroring forceUpdate.js:99-100 (which has no .trim()).
+  // whitespace, mirroring forceUpdate.js's strip-then-validate behavior (which
+  // has no .trim()).
   // Pre-fix, the extra .trim() let "1.88.0 " yield a phantom failed-row.
   describe('(nn) _extractTargetVersion rejects trailing whitespace (mirrors forceUpdate.js)', () => {
     it('rejects trailing space "1.88.0 "', () => {
@@ -1488,12 +1544,16 @@ describe('force_update last_update reporting', () => {
     const PARITY_INPUTS = [
       // Equal verdicts -- both accept
       '1.88.0', '>=1.88.0', '^1.88.0', '~1.88.0', '=1.88.0', ' 1.88.0',
-      '\t>=1.88.0', '= 1.88.0',
+      '\t>=1.88.0', '= 1.88.0', 'v1.88.0', '>=v1.88.0',
       '1.0.0-rc.1', '1.0.0+build.5', '1.0.0-rc.1+build.5',
+      '1.0.0-alpha-beta', '1.0.0-0.3.7', '1.0.0-x.7.z.92',
+      '1.0.0+20130313144700', '1.0.0-beta+exp.sha.5114f85',
       // Equal verdicts -- both reject
       '1.88.0 ', '1.88.0\t', '1.88.0\n', '1.88.0\r',
       '>=1.88.0 ', '1.88 .0', '1.88.0-rc 1',
-      'v1.88.0', '<1.88.0', '<=1.88.0', '>=v1.88.0',
+      '<1.88.0', '<=1.88.0',
+      '01.0.0', '1.02.0', '1.0.03', '1.0.0-01',
+      '1.0.0-alpha..1', '1.0.0-alpha_', '1.0.0+build_meta', '1.0.0+',
       '*', 'latest', '', '   ', '>= ',
       // Asymmetric (length): both accept but a2a TO_VERSION_MAX (32) caps it.
       // Listed but NOT checked for strict parity -- a2a is stricter on length,
@@ -1692,19 +1752,19 @@ describe('force_update last_update reporting', () => {
     assert.ok(!fs.existsSync(_statePath()), 'no pending, no file, no problem');
   });
 
-  // (bb) Pin the strip/validate contract against src/forceUpdate.js:44-45.
+  // (bb) Pin the strip/validate contract against src/forceUpdate.js.
   // The bug these guard against: _extractTargetVersion used to strip
-  // operators (notably "v" and "<"/"<=") that forceUpdate.js does NOT strip.
+  // operators (notably "<"/"<=") that forceUpdate.js does NOT strip.
   // Result -- telemetry would report to_version="1.88.0" for a directive
-  // (e.g. "v1.88.0" or "<2.0.0") that the upgrader itself rejects, producing
+  // (e.g. "<2.0.0") that the upgrader itself rejects, producing
   // ghost `failed` rows in EvolverUpgradeAttempt for upgrades that were
   // never even attempted. The cases below trace each input against
   // forceUpdate.js's `String(...).replace(/^[>=^~\s]+/, '')` strip class
-  // (matches >, =, ^, ~, whitespace -- NOT v, <, <=) followed by the same
-  // concrete-semver test.
-  describe('(bb) _extractTargetVersion mirrors forceUpdate.js:44-45', () => {
-    it('rejects "v1.88.0" (leading v is not in forceUpdate.js strip class)', () => {
-      assert.equal(_extractTargetVersionForTesting({ required_version: 'v1.88.0' }), '');
+  // (matches >, =, ^, ~, whitespace -- NOT < or <=), optional leading-v
+  // normalization, and the same concrete-semver test.
+  describe('(bb) _extractTargetVersion mirrors forceUpdate.js', () => {
+    it('accepts "v1.88.0" -> "1.88.0"', () => {
+      assert.equal(_extractTargetVersionForTesting({ required_version: 'v1.88.0' }), '1.88.0');
     });
     it('rejects "<1.88.0" (< is not in forceUpdate.js strip class)', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '<1.88.0' }), '');
@@ -1712,8 +1772,8 @@ describe('force_update last_update reporting', () => {
     it('rejects "<=1.88.0" (<= is not in forceUpdate.js strip class)', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '<=1.88.0' }), '');
     });
-    it('rejects ">=v1.88.0" (>= strips, leading v stays, semver fails)', () => {
-      assert.equal(_extractTargetVersionForTesting({ required_version: '>=v1.88.0' }), '');
+    it('accepts ">=v1.88.0" -> "1.88.0"', () => {
+      assert.equal(_extractTargetVersionForTesting({ required_version: '>=v1.88.0' }), '1.88.0');
     });
     it('accepts ">=1.88.0" -> "1.88.0"', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '>=1.88.0' }), '1.88.0');
@@ -1732,6 +1792,13 @@ describe('force_update last_update reporting', () => {
     });
     it('accepts a bare "1.88.0" -> "1.88.0"', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0' }), '1.88.0');
+    });
+    it('rejects malformed semver identifiers', () => {
+      assert.equal(_extractTargetVersionForTesting({ required_version: '01.88.0' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.03' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0-01' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0-alpha_' }), '');
+      assert.equal(_extractTargetVersionForTesting({ required_version: '1.88.0+build_meta' }), '');
     });
     it('rejects garbage / non-string / missing', () => {
       assert.equal(_extractTargetVersionForTesting({ required_version: '*' }), '');

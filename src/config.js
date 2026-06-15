@@ -136,9 +136,14 @@ const REPAIR_LOOP_THRESHOLD = envInt('EVOLVER_REPAIR_LOOP_THRESHOLD', 3);
 //
 // GENE_BAN_PER_KEY_ATTEMPTS:    minimum attempts on the same signal key
 // GENE_BAN_BEST_THRESHOLD:      best success rate at or below which the Gene is banned
+// GENE_INERT_BAN_STREAK:        consecutive inert (stable_no_error, zero-work) outcomes
+//                               on a signal key after which a Gene with no real
+//                               success is banned, so --loop selection explores
+//                               instead of re-running a do-nothing gene (#562)
 // GENE_EPIGENETIC_HARD_BOOST:   epigenetic boost at or below which the Gene is hard-suppressed
 const GENE_BAN_PER_KEY_ATTEMPTS = envInt('EVOLVER_GENE_BAN_PER_KEY_ATTEMPTS', 4);
 const GENE_BAN_BEST_THRESHOLD = envFloat('EVOLVER_GENE_BAN_BEST_THRESHOLD', 0.15);
+const GENE_INERT_BAN_STREAK = envInt('EVOLVER_GENE_INERT_BAN_STREAK', 8);
 const GENE_EPIGENETIC_HARD_BOOST = envFloat('EVOLVER_GENE_EPIGENETIC_HARD_BOOST', -0.3);
 const SESSION_ARCHIVE_TRIGGER = envInt('EVOLVER_SESSION_ARCHIVE_TRIGGER', 100);
 const SESSION_ARCHIVE_KEEP = envInt('EVOLVER_SESSION_ARCHIVE_KEEP', 50);
@@ -197,6 +202,40 @@ function reuseAttributionMode() {
   return v === 'shadow' ? 'shadow' : 'off';
 }
 
+// Opt-in Hub reuse-OUTCOME reporting (P4-a Slice B, client side). When 'on', the
+// evolver POSTs {signals, status, used_asset_ids} to the Hub's /a2a/memory/record
+// so the reuse-reward attribution pipeline (which reads THAT endpoint, not the
+// inert reuse_attribution blob on /a2a/memory/event) finally gets data.
+// MONEY-ADJACENT and charges Hub credits -> default 'off'. The Hub still
+// re-verifies every used_asset_id against its own AssetFetcher rows before
+// crediting. Also requires EVOLVER_REUSE_ATTRIBUTION=shadow, which is what builds
+// the cycle-correlated, timestamp-guarded attribution this report consumes.
+const OUTCOME_REPORT_MODE = envStr('EVOLVER_OUTCOME_REPORT', 'off');
+function outcomeReportMode() {
+  const v = String(process.env.EVOLVER_OUTCOME_REPORT || OUTCOME_REPORT_MODE || 'off').toLowerCase().trim();
+  return v === 'on' || v === 'enforce' || v === 'true' ? 'on' : 'off';
+}
+
+// --- Anti-abuse telemetry (privacy-preserving heartbeat summary) ---
+// Enabled by default. In heartbeat mode, clients attach a small
+// `meta.anti_abuse` envelope with low-sensitive hashes, source-confidence
+// labels, and explicit placeholders for data that must be observed by Hub
+// services instead of trusted from the client.
+const ANTI_ABUSE_TELEMETRY_MODE = envStr('EVOLVER_ANTI_ABUSE_TELEMETRY', 'heartbeat');
+function antiAbuseTelemetryMode() {
+  const raw = process.env.EVOLVER_ANTI_ABUSE_TELEMETRY;
+  const v = String(raw == null ? '' : raw).toLowerCase().trim();
+  // Empty / whitespace-only counts as UNSET (same as envStr's '' -> fallback
+  // above): a blank `EVOLVER_ANTI_ABUSE_TELEMETRY=` line in a .env file must
+  // not silently disable the documented default-on behavior. Opt-out is
+  // explicit only.
+  if (v === '') return 'heartbeat';
+  if (v === '0' || v === 'false' || v === 'no' || v === 'off') return 'off';
+  return (v === '1' || v === 'true' || v === 'yes' || v === 'on' || v === 'heartbeat')
+    ? 'heartbeat'
+    : 'off';
+}
+
 // --- Validator mode (opt-out) ---
 // Node role: the evolver periodically fetches assigned validation tasks from
 // the Hub, runs the commands in an isolated sandbox, and submits
@@ -243,6 +282,7 @@ module.exports = {
   REPAIR_LOOP_THRESHOLD,
   GENE_BAN_PER_KEY_ATTEMPTS,
   GENE_BAN_BEST_THRESHOLD,
+  GENE_INERT_BAN_STREAK,
   GENE_EPIGENETIC_HARD_BOOST,
   SESSION_ARCHIVE_TRIGGER,
   SESSION_ARCHIVE_KEEP,
@@ -280,6 +320,12 @@ module.exports = {
   // Reuse attribution (P4-a Slice A)
   REUSE_ATTRIBUTION_MODE,
   reuseAttributionMode,
+  // Reuse-outcome Hub reporting (P4-a Slice B, opt-in)
+  OUTCOME_REPORT_MODE,
+  outcomeReportMode,
+  // Anti-abuse telemetry
+  ANTI_ABUSE_TELEMETRY_MODE,
+  antiAbuseTelemetryMode,
   // Validator (opt-in role)
   VALIDATOR_ENABLED,
   VALIDATOR_STAKE_AMOUNT,

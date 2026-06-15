@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { PROXY_PROTOCOL_VERSION } = require('../mailbox/store');
+const { buildEnvelope } = require('../envelope');
 const crypto = require('crypto');
 const { hubFetch } = require('../../gep/hubFetch');
 const { getEvomapPath } = require('../../gep/paths');
@@ -265,6 +266,11 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
     let noop = false;
     let busy = false;
     let thrownErr = null;
+    // Structured failure object ({ ok:false, code, detail }) when the upgrader
+    // RETURNED a failure; forwarded to reportForceUpdateOutcome so the hub gets
+    // the precise branch code instead of "executeForceUpdate returned false".
+    // Hoisted out of the try because `result` is block-scoped there.
+    let failureResult = null;
     try {
       const mod = require('../../forceUpdate');
       const result = mod.executeForceUpdate(forceUpdate);
@@ -286,6 +292,11 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
       // src/gep/a2aProtocol.js (search FORCE_UPDATE_BUSY).
       busy = (result === mod.FORCE_UPDATE_BUSY);
       updated = (result === true);
+      // Inline the failure-shape check rather than calling mod.isForceUpdateFailure:
+      // keeps this robust against partial test mocks of forceUpdate that stub
+      // executeForceUpdate but omit the helper (a missing-function throw here
+      // would otherwise demote a real success to "failed").
+      failureResult = (result && typeof result === 'object' && result.ok === false) ? result : null;
     } catch (e) {
       thrownErr = e;
       try {
@@ -296,6 +307,7 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
       _proxyForceUpdateInFlight = false;
     }
     if (busy) {
+      _proxyForceUpdateLastAttemptAt = 0;
       try {
         logger.log('[ForceUpdate] proxy heartbeat-trigger observed BUSY (concurrent invocation). Skipping telemetry; in-flight caller owns the outcome.');
       } catch (_) { /* logger broken; non-fatal */ }
@@ -310,6 +322,7 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
         updated: updated,
         noop: noop,
         error: thrownErr,
+        failure: failureResult,
         fromVersion: fromVersion,
       });
     } catch (e) {
@@ -321,6 +334,7 @@ function _maybeTriggerForceUpdateFromHeartbeat(forceUpdate, logger) {
       try { logger.log('[ForceUpdate] Update complete (proxy heartbeat-trigger). Exiting for restart...'); } catch (_) {}
       try { process.exit(78); } catch (_) {}
     } else if (noop) {
+      _proxyForceUpdateLastAttemptAt = 0;
       try {
         logger.log('[ForceUpdate] No-op (proxy heartbeat-trigger): already at required version. Skipping restart.');
       } catch (_) {}
@@ -350,6 +364,7 @@ class LifecycleManager {
     this._heartbeatTimer = null;
     this._running = false;
     this._startedAt = null;
+    this._lastHeartbeatTickAt = 0;
     this._consecutiveFailures = 0;
     this._reauthInProgress = false;
     this._helloRateLimitUntil = 0;
@@ -513,13 +528,7 @@ class LifecycleManager {
     const fp = _getEnvFingerprint();
 
     const body = {
-      protocol: 'gep-a2a',
-      protocol_version: '1.0.0',
-      message_type: 'hello',
-      message_id: 'msg_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex'),
-      sender_id: nodeId,
-      timestamp: new Date().toISOString(),
-      payload,
+      ...buildEnvelope('hello', payload, nodeId),
       env_fingerprint: fp,
     };
 
@@ -691,6 +700,7 @@ class LifecycleManager {
     try { this.store.setState('node_secret', ''); } catch { /* best-effort */ }
     // Clear the source tag too -- nothing is stored, nothing to attribute.
     try { this.store.setState('node_secret_source', ''); } catch { /* best-effort */ }
+    try { this.store.setState('node_secret_env_suppressed', 'true'); } catch { /* best-effort */ }
     // Suppress the env override for this process so _resolveNodeSecret stops
     // re-seeding the store with the same stale env value next call.
     this._suppressEnvSecret = true;
@@ -746,6 +756,25 @@ class LifecycleManager {
           ...taskMeta,
         },
       };
+
+      try {
+        const cfg = require('../../config');
+        if (cfg.antiAbuseTelemetryMode && cfg.antiAbuseTelemetryMode() === 'heartbeat') {
+          const { buildHeartbeatAntiAbuseTelemetry } = require('../../gep/antiAbuseTelemetry');
+          body.meta.anti_abuse = buildHeartbeatAntiAbuseTelemetry({
+            source: 'evolver-proxy',
+            nodeId: this.nodeId,
+            envFingerprint: fp,
+            taskMeta: body.meta,
+            // This heartbeat is sent FROM the running proxy — ground truth,
+            // not env sniffing (this process usually has neither EVOMAP_PROXY
+            // nor EVOMAP_PROXY_PORT set, which would misreport false).
+            proxyPortConfigured: true,
+          });
+        }
+      } catch (e) {
+        this.logger.warn(`[AntiAbuseTelemetry] failed to build heartbeat summary: ${e && e.message || e}`);
+      }
 
       // Attach any pending force_update outcome so the hub-side
       // EvolverUpgradeAttempt table gets a row. Captured in a local so the
@@ -1021,6 +1050,7 @@ class LifecycleManager {
 
   async _heartbeatTick(myGen) {
     if (!this._running) return;
+    this._lastHeartbeatTickAt = Date.now();
     // Defence-in-depth: even with heartbeat() now fully wrapped (see
     // its body), an unforeseen synchronous throw inside the awaited
     // path or a defective stub passed in tests would still bubble
@@ -1085,6 +1115,16 @@ class LifecycleManager {
       clearInterval(this._driftInterval);
       this._driftInterval = null;
     }
+  }
+
+  getHeartbeatStats() {
+    return {
+      running: this._running,
+      intervalMs: this._heartbeatInterval || DEFAULT_HEARTBEAT_INTERVAL,
+      uptimeMs: this._startedAt ? Date.now() - this._startedAt : 0,
+      consecutiveFailures: this._consecutiveFailures,
+      lastTickAt: this._lastHeartbeatTickAt,
+    };
   }
 
   _shouldUpgrade(minVersion) {

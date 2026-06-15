@@ -1,11 +1,9 @@
 # 🧬 Evolver
 
-[![GitHub stars](https://img.shields.io/github/stars/EvoMap/evolver?style=social)](https://github.com/EvoMap/evolver/stargazers)
+[![GitHub stars](https://img.shields.io/badge/Stars-8.7k-2b3137?logo=github&logoColor=white)](https://github.com/EvoMap/evolver/stargazers)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](https://opensource.org/licenses/GPL-3.0)
 [![Node.js >= 18](https://img.shields.io/badge/Node.js-%3E%3D%2018-green.svg)](https://nodejs.org/)
-[![GitHub last commit](https://img.shields.io/github/last-commit/EvoMap/evolver)](https://github.com/EvoMap/evolver/commits/main)
 [![npm downloads](https://img.shields.io/npm/dm/@evomap/evolver.svg)](https://www.npmjs.com/package/@evomap/evolver)
-[![GitHub issues](https://img.shields.io/github/issues/EvoMap/evolver)](https://github.com/EvoMap/evolver/issues)
 [![arXiv](https://img.shields.io/badge/arXiv-2604.15097-b31b1b.svg)](https://arxiv.org/abs/2604.15097)
 
 ![Evolver Cover](assets/cover.png)
@@ -148,6 +146,14 @@ how `setup-hooks --platform=codex` wires Evolver in), but it does **not**
 emit a session transcript file the way Cursor / Claude Code / opencode do.
 That means `evolver --review` cannot read raw session logs on Codex.
 
+`setup-hooks --platform=codex` is lifecycle integration only; it does not route
+Codex model requests through Evolver Proxy. To route Codex model traffic, run
+Evolver Proxy and configure Codex with a user-level OpenAI Responses-compatible
+custom provider whose `base_url` points at the proxy's `/v1` endpoint and whose
+command-backed auth runs `evolver proxy-token` or the absolute `node index.js
+proxy-token --settings ...` helper emitted by `scripts/internal-proxy-env.sh
+--codex-config` from a source checkout.
+
 Evolver compensates by reading, in order:
 
 1. `MEMORY.md` / `USER.md` in the workspace root (if you maintain them);
@@ -203,7 +209,7 @@ When running inside a host runtime (e.g., [OpenClaw](https://openclaw.com)), the
 | Loop (`evolver --loop`) | Repeats the above in a daemon loop with adaptive sleep |
 | Inside OpenClaw | Host runtime interprets stdout directives like `sessions_spawn(...)` |
 
-> **`--loop` is not a real-time agent assistant.** Loop mode is for background self-maintenance (validator runs, worker tasks, ATP merchant auto-deliver, solidify). Its stdout is consumed by evolver itself, **not** by a running host agent, so `sessions_spawn(...)` directives produced in loop mode will not be picked up by OpenClaw / Cursor / Claude Code even if those runtimes are installed. If you want evolver to observe and advise a live agent session, call `evolver run` from **inside** that agent session (OpenClaw will pick up the stdout directives on that single run). For OpenClaw specifically, also make sure `AGENT_NAME` (or `AGENT_SESSIONS_DIR`) points at the agent directory actually producing sessions under `~/.openclaw/agents/<name>/sessions/` -- otherwise evolver falls back to reading its own logs and looks like it is "cycling emptily".
+> **`--loop` is not a real-time agent assistant.** Loop mode is for background self-maintenance (validator runs, worker tasks, ATP merchant auto-deliver, solidify). Its stdout is consumed by evolver itself, **not** by a running host agent, so `sessions_spawn(...)` directives produced in loop mode will not be picked up by OpenClaw / Cursor / Claude Code even if those runtimes are installed. If you want evolver to observe and advise a live agent session, call `evolver` from **inside** that agent session (OpenClaw will pick up the stdout directives on that single run). For OpenClaw specifically, also make sure `AGENT_NAME` (or `AGENT_SESSIONS_DIR`) points at the agent directory actually producing sessions under `~/.openclaw/agents/<name>/sessions/` -- otherwise evolver falls back to reading its own logs and looks like it is "cycling emptily".
 
 ## Who This Is For / Not For
 
@@ -410,6 +416,7 @@ Evolver is designed to be **environment-agnostic**.
 | `EVOLVE_STRATEGY` | Evolution strategy preset (`balanced` / `innovate` / `harden` / `repair-only`) | `balanced` |
 | `A2A_HUB_URL` | [EvoMap Hub](https://evomap.ai) URL | _(unset, offline mode)_ |
 | `A2A_NODE_ID` | Your node identity on the network | _(auto-generated from device fingerprint)_ |
+| `EVOMAP_HUB_IP_FAMILY` | Hub egress IP-family policy: `ipv4first` tries IPv4 first and falls back to dual-stack, `auto` uses dual-stack as the primary path, `ipv4-only` disables fallback | `ipv4first` |
 | `HEARTBEAT_INTERVAL_MS` | Hub heartbeat interval | `360000` (6 min) |
 | `MEMORY_DIR` | Memory files path | `./memory` |
 | `EVOLVE_REPORT_TOOL` | Tool name for reporting results | `message` |
@@ -442,7 +449,7 @@ Persistent flag override: when the env is unset, the runtime reads `~/.evomap/fe
 To opt out permanently:
 
 ```bash
-EVOLVER_VALIDATOR_ENABLED=0 evolver run --loop
+EVOLVER_VALIDATOR_ENABLED=0 evolver --loop
 ```
 
 ### Auto GitHub Issue Reporting
@@ -452,7 +459,7 @@ When the evolver detects persistent failures (failure loop or recurring errors w
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `EVOLVER_AUTO_ISSUE` | `true` | Enable/disable auto issue reporting |
-| `EVOLVER_ISSUE_REPO` | `autogame-17/capability-evolver` | Target GitHub repository (owner/repo) |
+| `EVOLVER_ISSUE_REPO` | `EvoMap/evolver` | Target GitHub repository (owner/repo) |
 | `EVOLVER_ISSUE_COOLDOWN_MS` | `86400000` (24h) | Cooldown period for the same error signature |
 | `EVOLVER_ISSUE_MIN_STREAK` | `5` | Minimum consecutive failure streak to trigger |
 
@@ -494,33 +501,6 @@ External Gene/Capsule assets ingested via `scripts/a2a_ingest.js` are staged in 
 
 The `sessions_spawn(...)` strings in `index.js` and `evolve.js` are **text output to stdout**, not direct function calls. Whether they are interpreted depends on the host runtime (e.g., OpenClaw platform). The evolver itself does not invoke `sessions_spawn` as executable code.
 
-## Public Release
-
-This repository is the public distribution.
-
-- Build public output: `npm run build`
-- Publish public output: `npm run publish:public`
-- Dry run: `DRY_RUN=true npm run publish:public`
-
-Required env vars:
-
-- `PUBLIC_REMOTE` (default: `public`)
-- `PUBLIC_REPO` (e.g. `EvoMap/evolver`)
-- `PUBLIC_OUT_DIR` (default: `dist-public`)
-- `PUBLIC_USE_BUILD_OUTPUT` (default: `true`)
-
-Optional env vars:
-
-- `SOURCE_BRANCH` (default: `main`)
-- `PUBLIC_BRANCH` (default: `main`)
-- `RELEASE_TAG` (e.g. `v1.0.41`)
-- `RELEASE_TITLE` (e.g. `v1.0.41 - GEP protocol`)
-- `RELEASE_NOTES` or `RELEASE_NOTES_FILE`
-- `GITHUB_TOKEN` (or `GH_TOKEN` / `GITHUB_PAT`) for GitHub Release creation
-- `RELEASE_SKIP` (`true` to skip creating a GitHub Release; default is to create)
-- `RELEASE_USE_GH` (`true` to use `gh` CLI instead of GitHub API)
-- `PUBLIC_RELEASE_ONLY` (`true` to only create a Release for an existing tag; no publish)
-
 ## Versioning (SemVer)
 
 MAJOR.MINOR.PATCH
@@ -555,8 +535,12 @@ Clone it into any directory you like. If you use [OpenClaw](https://openclaw.com
 
 ## Roadmap
 
-- Add a one-minute demo workflow
-- Add a comparison table vs alternatives
+Directional, not commitments — the live backlog lives in [GitHub Issues](https://github.com/EvoMap/evolver/issues).
+
+- **Onboarding**: a one-minute quickstart demo and a comparison table vs. alternative agent-evolution approaches.
+- **Deeper GEP integration**: richer signal extraction and Gene / Capsule selection, plus reuse analytics.
+- **Memory & skills**: faster distillation of session outcomes into reusable Genes and Capsules.
+- **Broader runtime coverage**: more first-class host integrations beyond Cursor / Claude Code / Codex / Kiro / opencode / OpenClaw.
 
 ## Star History
 
@@ -579,6 +563,16 @@ Clone it into any directory you like. If you use [OpenClaw](https://openclaw.com
 
 ## License
 
-[MIT](https://opensource.org/licenses/MIT)
+[GPL-3.0-or-later](https://opensource.org/licenses/GPL-3.0)
 
 > Core evolution engine modules are distributed in obfuscated form to protect intellectual property. Source: [EvoMap/evolver](https://github.com/EvoMap/evolver).
+
+## Download History
+
+Evolver ships through three channels — the [npm package](https://www.npmjs.com/package/@evomap/evolver), prebuilt binaries on [GitHub Releases](https://github.com/EvoMap/evolver/releases), and the [ClawHub](https://skill-history.com/autogame-17/evolver) skill registry:
+
+[![npm](https://img.shields.io/npm/dm/@evomap/evolver?logo=npm&label=npm)](https://www.npmjs.com/package/@evomap/evolver)
+[![npm total](https://img.shields.io/npm/d18m/@evomap/evolver?logo=npm&label=npm%20total)](https://npm-stat.com/charts.html?package=@evomap/evolver)
+[![GitHub releases](https://img.shields.io/github/downloads/EvoMap/evolver/total?logo=github&label=GitHub%20releases)](https://github.com/EvoMap/evolver/releases)
+
+[![ClawHub download history](https://skill-history.com/chart/autogame-17/evolver.svg)](https://skill-history.com/autogame-17/evolver)

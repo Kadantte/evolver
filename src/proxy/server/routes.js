@@ -3,7 +3,20 @@
 const { PROXY_PROTOCOL_VERSION, SCHEMA_VERSION } = require('../mailbox/store');
 
 function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
-  const { dmHandler, skillUpdater, getHubMailboxStatus, sessionHandler, messagesHandler } = extensions || {};
+  const {
+    dmHandler,
+    skillUpdater,
+    getHubMailboxStatus,
+    sessionHandler,
+    messagesHandler,
+    responsesHandler,
+    geminiHandler,
+    chatCompletionsHandler,
+    modelsHandler,
+    ollamaChatHandler,
+    ollamaGenerateHandler,
+    vertexHandler,
+  } = extensions || {};
   const routes = {
     // -- Mailbox --
     'POST /mailbox/send': async ({ body }) => {
@@ -73,14 +86,17 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
     },
 
     'POST /asset/submit': async ({ body }) => {
-      if (!body.assets && !body.asset_id) {
-        throw Object.assign(new Error('assets or asset_id is required'), { statusCode: 400 });
+      // The publish path builds a bundle from full asset objects; a bare
+      // asset_id is not a valid input here (Bugbot #256 Medium — route used to
+      // accept asset_id the handler then ignored).
+      if (!body.assets && !body.asset) {
+        throw Object.assign(new Error('assets (array) or asset (single object) is required'), { statusCode: 400 });
       }
-      const result = store.send({
-        type: 'asset_submit',
-        payload: body,
-        priority: body.priority || 'normal',
-      });
+      // Publish synchronously via the signed Gene+Capsule bundle path
+      // (POST /a2a/publish). The old `asset_submit` mailbox dispatch is gated
+      // off at the Hub (A2A_MAILBOX_ASSET_SUBMIT_ENABLED), so it silently
+      // failed; the Hub now enforces bundles. Returns the per-asset Hub result.
+      const result = await proxyHandlers.assetPublish(body);
       return { body: result };
     },
 
@@ -465,6 +481,34 @@ function buildRoutes(store, proxyHandlers, taskMonitor, extensions) {
   // EVOMAP_ROUTER_ENABLED behavior inside the handler.
   if (messagesHandler) {
     routes['POST /v1/messages'] = messagesHandler;
+  }
+  if (responsesHandler) {
+    routes['POST /v1/responses'] = responsesHandler;
+  }
+  if (geminiHandler) {
+    // Native Gemini path: model + action (generateContent | streamGenerateContent) are one path segment
+    // (`<model>:<action>`), matched as :modelAction and split by the handler.
+    routes['POST /v1beta/models/:modelAction'] = geminiHandler;
+  }
+  if (chatCompletionsHandler) {
+    // OpenAI Chat Completions ingress (cursor's OpenAI mode + generic OpenAI clients) → OpenAI upstream.
+    routes['POST /v1/chat/completions'] = chatCompletionsHandler;
+  }
+  if (modelsHandler) {
+    // Model-list probe (codex/opencode/cursor/SDKs hit it on startup) → routed by anthropic-version header to
+    // the Anthropic or OpenAI upstream's /v1/models, so the probe never 404s.
+    routes['GET /v1/models'] = modelsHandler;
+  }
+  if (ollamaChatHandler) {
+    // Ollama native ingress (local/self-hosted models) → Ollama upstream, NDJSON streaming.
+    routes['POST /api/chat'] = ollamaChatHandler;
+  }
+  if (ollamaGenerateHandler) {
+    routes['POST /api/generate'] = ollamaGenerateHandler;
+  }
+  if (vertexHandler) {
+    // Vertex AI Gemini native path: project/location/model:action across fixed segments + :modelAction.
+    routes['POST /v1/projects/:project/locations/:location/publishers/google/models/:modelAction'] = vertexHandler;
   }
 
   return routes;
